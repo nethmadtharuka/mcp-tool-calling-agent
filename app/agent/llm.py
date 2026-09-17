@@ -1,0 +1,36 @@
+"""LLM provider abstraction.
+
+Isolated here so swapping or adding providers later doesn't touch the
+graph or API layers.
+"""
+
+from typing import Protocol
+
+from langchain_core.messages import AIMessage, BaseMessage
+
+from app.core.config import Settings
+
+
+class ChatModel(Protocol):
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage: ...
+
+
+class MockChatModel:
+    """Deterministic stand-in used when LLM_PROVIDER=mock, so the app runs
+    end-to-end without any API key."""
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        last_message = messages[-1].content if messages else ""
+        return AIMessage(content=f"[mock response] You said: {last_message}")
+
+
+def get_llm(settings: Settings) -> ChatModel:
+    if settings.mock_mode:
+        return MockChatModel()
+
+    if settings.llm_provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=settings.llm_model, api_key=settings.llm_api_key)
+
+    raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
