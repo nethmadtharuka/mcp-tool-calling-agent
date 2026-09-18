@@ -1,71 +1,20 @@
 """State definition for the LangGraph workflow."""
 
-from typing import TypedDict
+from typing import Annotated, TypedDict
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 
 class AgentState(TypedDict):
-    message: str
-    response: str
-
-#The information currently being carried through the agent workflow.
-#right now we only have the massage and the respoonse only 
-# #For example:
-
-# {
-#     "message": "Hello",
-#     "response": ""
-# }
-
-# After the LLM:
-
-# {
-#     "message": "Hello",
-#     "response": "Hello! How can I help?"
-# }
-
-
-# Why do we need state?
-
-# Because LangGraph is designed for workflows.
-
-# Imagine later:
-
-# START
-#  ↓
-# Understand request
-#  ↓
-# Search GitHub
-#  ↓
-# Analyze issue
-#  ↓
-# Read source code
-#  ↓
-# Generate answer
-#  ↓
-# END
-
-# Each step needs information from previous steps.
-
-# State is how we carry that information.
-
-# Eventually our state could become:
-
-# AgentState
-# │
-# ├── user_message
-# ├── messages
-# ├── repository
-# ├── issues
-# ├── files
-# ├── tool_results
-# ├── analysis
-# └── final_answer
-
-# But not yet.
-
-# For Phase 1:
-
-# message
-# response
-
-# is enough.
+    # add_messages is a LangGraph reducer: a node only returns the NEW
+    # message(s) it produced, and LangGraph appends them onto this list
+    # for us. Without it we'd have to manually concatenate history in
+    # every node.
+    #
+    # Over one tool-calling request this list grows like:
+    #   [HumanMessage]                                   after the user asks
+    #   [HumanMessage, AIMessage(tool_calls=[...])]       agent decides to call a tool
+    #   [..., ToolMessage(result)]                        tool node runs the function
+    #   [..., AIMessage(final answer)]                    agent reads the result, answers
+    messages: Annotated[list[BaseMessage], add_messages]
