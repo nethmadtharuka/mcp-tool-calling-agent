@@ -16,6 +16,7 @@ client = TestClient(app)
 # ---------------------------------------------------------------------------
 # HTTP-level tests using the built-in MockChatModel (default LLM_PROVIDER).
 # It never returns tool_calls, so these only exercise the "no tool" path.
+# TestClient handles the now-async /api/agent/run endpoint transparently.
 # ---------------------------------------------------------------------------
 
 
@@ -47,7 +48,7 @@ class FakeNoToolLLM:
     def bind_tools(self, tools):
         return self
 
-    def invoke(self, messages):
+    async def ainvoke(self, messages):
         return AIMessage(content="An AI agent perceives, decides, and acts.")
 
 
@@ -58,7 +59,7 @@ class FakeToolCallingLLM:
     def bind_tools(self, tools):
         return self
 
-    def invoke(self, messages):
+    async def ainvoke(self, messages):
         already_ran_tool = any(m.type == "tool" for m in messages)
         if already_ran_tool:
             tool_result = next(m.content for m in messages if m.type == "tool")
@@ -69,18 +70,69 @@ class FakeToolCallingLLM:
         )
 
 
-def test_no_tool_needed(monkeypatch):
+async def test_no_tool_needed(monkeypatch):
     monkeypatch.setattr(nodes, "get_llm", lambda settings: FakeNoToolLLM())
-    result = run_agent("What is an AI agent?")
+    result = await run_agent("What is an AI agent?")
     assert result == "An AI agent perceives, decides, and acts."
 
 
-def test_tool_call_required(monkeypatch):
+async def test_tool_call_required(monkeypatch):
     monkeypatch.setattr(nodes, "get_llm", lambda settings: FakeToolCallingLLM())
-    result = run_agent("What is this project's name?")
+    result = await run_agent("What is this project's name?")
     assert "Production-Oriented AI Engineering Agent" in result
 
 
-def test_graph_execution_directly():
-    result = run_agent("ping")
+async def test_graph_execution_directly():
+    result = await run_agent("ping")
     assert "ping" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: prove a GitHub MCP tool is selected and executed, without a real
+# Docker container or GitHub token. A fake MCP tool stands in for the real
+# one discovered from github-mcp-server - same shape (name + ainvoke), just
+# not talking to a subprocess.
+# ---------------------------------------------------------------------------
+
+
+class FakeGithubMcpTool:
+    name = "list_issues"
+
+    async def ainvoke(self, args):
+        return f"2 open issues in {args.get('repo', 'unknown repo')}"
+
+
+class FakeGithubToolCallingLLM:
+    """First turn: asks to call the GitHub MCP tool. Second turn: answers
+    using its result."""
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages):
+        already_ran_tool = any(m.type == "tool" for m in messages)
+        if already_ran_tool:
+            tool_result = next(m.content for m in messages if m.type == "tool")
+            return AIMessage(content=f"Here's what I found: {tool_result}")
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "list_issues",
+                    "args": {"owner": "octocat", "repo": "Hello-World"},
+                    "id": "call_1",
+                }
+            ],
+        )
+
+
+async def test_mcp_tool_call_required(monkeypatch):
+    monkeypatch.setattr(nodes, "get_llm", lambda settings: FakeGithubToolCallingLLM())
+
+    async def fake_get_mcp_tools(settings):
+        return [FakeGithubMcpTool()]
+
+    monkeypatch.setattr(nodes, "get_mcp_tools", fake_get_mcp_tools)
+
+    result = await run_agent("List open issues in octocat/Hello-World")
+    assert "2 open issues in Hello-World" in result

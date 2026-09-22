@@ -38,6 +38,8 @@ def build_graph():
 _compiled_graph = build_graph()
 
 
-def run_agent(message: str) -> str:
-    result = _compiled_graph.invoke({"messages": [HumanMessage(content=message)]})
+async def run_agent(message: str) -> str:
+    # ainvoke, not invoke: agent_node/tool_node now await GitHub MCP calls
+    # (stdio/network I/O), so the whole graph runs async.
+    result = await _compiled_graph.ainvoke({"messages": [HumanMessage(content=message)]})
     return result["messages"][-1].content

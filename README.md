@@ -2,30 +2,29 @@
 
 ## Current Phase
 
-**Phase 2 — Tool calling fundamentals.** The agent can now decide, on its
-own, whether it needs a local Python tool before answering. No MCP yet.
+**Phase 3 — GitHub MCP.** The agent can now discover and call tools from
+a separate GitHub MCP server process, in addition to its local Phase 2
+tool. Read-only only.
 
 ## Current Architecture
 
 ```text
 Client
   ↓
-FastAPI          (app/api/routes.py)
+FastAPI          (app/api/routes.py, async)
   ↓
 LangGraph        (app/agent/graph.py: START -> agent -> (tool?) -> END)
   ↓
 LLM              (app/agent/llm.py: mock or OpenAI, chosen by env var)
+  ↓
+local tool (app/agent/tools.py) or GitHub MCP tool (app/agent/mcp_tools.py)
   ↓
 Response
 ```
 
 ## Future Architecture (not implemented yet)
 
-MCP will be introduced in Phase 3. Later phases will add a second MCP
-server and a deployment path:
-
 ```text
-GitHub MCP
 Filesystem MCP
 Docker
 Kubernetes
@@ -43,7 +42,8 @@ app/
 │   ├── nodes.py         agent_node (calls the LLM) + tool_node (runs tools)
 │   ├── graph.py          Builds the graph: agent -> (tool?) -> agent -> END
 │   ├── llm.py             LLM provider abstraction (mock / openai)
-│   └── tools.py            The one Phase 2 tool: get_project_info()
+│   ├── tools.py            The Phase 2 local tool: get_project_info()
+│   └── mcp_tools.py         Phase 3: discovers tools from github-mcp-server
 └── core/config.py      Env-based settings, fails clearly if misconfigured
 tests/                 pytest suite (uses the mock LLM, no API key needed)
 run.py                 Dev server entrypoint
@@ -195,5 +195,85 @@ deterministically exercise both branches of the graph. Run with `pytest`.
 To verify against a real model, set `LLM_PROVIDER=openai` and a real
 `LLM_API_KEY` in `.env`, then use the Postman requests above.
 
-MCP (GitHub and Filesystem tool access over the Model Context Protocol)
-will be introduced in Phase 3.
+## Phase 3 — GitHub MCP
+
+### What changed vs. Phase 2
+
+Phase 2's tool (`get_project_info`) is a Python function we wrote,
+executed in-process. Phase 3 adds tools that come from a *separate
+process* - GitHub's official MCP server - discovered at runtime instead
+of hand-written:
+
+```text
+PHASE 2                                PHASE 3
+LLM                                     LLM
+ |                                       |
+tool_calls detected                     tool_calls detected
+ |                                       |
+tool_fn.invoke(args)  (in-process)      MCP Client --stdio--> github-mcp-server --HTTPS--> GitHub API
+ |                                       |
+ToolMessage                             ToolMessage (same shape)
+ |                                       |
+LLM                                     LLM
+```
+
+Both kinds of tool end up bound to the LLM and executed the same way
+(`agent_node`/`tool_node` in `app/agent/nodes.py` don't care which is
+which) - that's the point of MCP: a standard shape for "here's a tool,"
+regardless of where it actually runs.
+
+Because a GitHub MCP call is real network I/O, the whole request path is
+now `async`: `app/api/routes.py`'s `run()`, `app/agent/graph.py`'s
+`run_agent()`, and both graph nodes.
+
+### Running the GitHub MCP server
+
+Requires Docker Desktop running locally. We don't start it by hand - the
+MCP client (`app/agent/mcp_tools.py`) launches
+`docker run -i --rm ghcr.io/github/github-mcp-server stdio --read-only`
+as a subprocess and talks to it over stdio the first time a GitHub tool
+is needed.
+
+`--read-only` is hardcoded in `mcp_tools.py`, not an env var - the agent
+cannot create, update, delete, merge, or push anything on GitHub, and
+that can't be changed by misconfiguring `.env`.
+
+### Setup
+
+```bash
+GITHUB_PERSONAL_ACCESS_TOKEN=<a fine-grained PAT, read-only, scoped to specific repos>
+GITHUB_TOOLSETS=repos,issues,pull_requests
+```
+
+If `GITHUB_PERSONAL_ACCESS_TOKEN` is unset, GitHub MCP is simply skipped
+(logged, not an error) - the agent still works with just the local
+Phase 2 tool. This keeps `pytest` and mock-mode runs working with no
+Docker and no GitHub account.
+
+### Postman
+
+Same endpoint, `POST http://localhost:8000/api/agent/run`.
+
+Local tool / no GitHub needed (regression check):
+```json
+{ "message": "What is this project's name?" }
+```
+
+GitHub MCP tool:
+```json
+{ "message": "List the open issues in octocat/Hello-World" }
+```
+
+Watch server logs - same log lines as Phase 2
+(`Calling LLM...` / `LLM requested tool call(s): [...]` /
+`Executing tool '...'` / `Tool '...' result: ...`), because MCP tools
+flow through the identical `tool_node` code path.
+
+### Testing without Docker or a real GitHub token
+
+`tests/test_agent.py` adds `FakeGithubMcpTool` + `FakeGithubToolCallingLLM`,
+monkeypatched in the same way as Phase 2's fakes, so the "LLM picks an
+MCP tool, tool executes, result comes back" loop is proven without
+spawning a container or calling GitHub. Run with `pytest`.
+
+Filesystem MCP will be introduced in Phase 4.
