@@ -3,6 +3,9 @@ uvicorn[standard]
 langgraph
 langchain-core
 langchain-openai
+langchain-mcp-adapters>=0.3.2
+mcp>=1.24.0
 python-dotenv
 pytest
+pytest-asyncio
 httpx

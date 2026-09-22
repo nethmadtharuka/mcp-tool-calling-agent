@@ -14,6 +14,11 @@ from app.core.config import Settings
 class ChatModel(Protocol):
     def invoke(self, messages: list[BaseMessage]) -> AIMessage: ...
 
+    # Phase 3: MCP tool calls go over stdio/network, so the graph is
+    # async end-to-end. A real ChatOpenAI already has ainvoke built in;
+    # MockChatModel needs one too so LLM_PROVIDER=mock keeps working.
+    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage: ...
+
     # A real ChatOpenAI already has bind_tools built in. MockChatModel
     # needs one too, purely so LLM_PROVIDER=mock doesn't crash once
     # nodes.py starts calling llm.bind_tools(...) unconditionally.
@@ -30,6 +35,9 @@ class MockChatModel:
     def invoke(self, messages: list[BaseMessage]) -> AIMessage:
         last_message = messages[-1].content if messages else ""
         return AIMessage(content=f"[mock response] You said: {last_message}")
+
+    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
+        return self.invoke(messages)
 
     def bind_tools(self, tools: list) -> "MockChatModel":
         # The mock never decides to call a tool - it just ignores them.

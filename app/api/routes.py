@@ -1,5 +1,6 @@
 """API routes."""
     #this is where the outside talk to the system
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 #APIRouter-this make us to group related API endpoints together
@@ -24,12 +25,16 @@ def health() -> dict[str, str]:
 
 #when api post comes to /api/agent/run API execute this function
 @router.post("/api/agent/run", response_model=AgentRunResponse)
-def run(request: AgentRunRequest) -> AgentRunResponse:
-    
+async def run(request: AgentRunRequest) -> AgentRunResponse:
     try:
-        response = run_agent(request.message) #here now we leave the API page andgo to the app/agent/graph.py 
+        response = await run_agent(request.message)
     except ConfigError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Agent failed: {exc}") from exc
+        logging.exception("Agent execution failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Agent failed: {exc}"
+        ) from exc
+
     return AgentRunResponse(response=response)
