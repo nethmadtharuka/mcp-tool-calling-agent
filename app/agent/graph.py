@@ -38,8 +38,19 @@ def build_graph():
 _compiled_graph = build_graph()
 
 
+def _as_text(content: str | list) -> str:
+    # OpenAI/mock return content as a plain string. Gemini returns a list
+    # of content blocks (e.g. [{"type": "text", "text": "..."}]) instead.
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "") if isinstance(block, dict) else str(block)
+        for block in content
+    )
+
+
 async def run_agent(message: str) -> str:
     # ainvoke, not invoke: agent_node/tool_node now await GitHub MCP calls
     # (stdio/network I/O), so the whole graph runs async.
     result = await _compiled_graph.ainvoke({"messages": [HumanMessage(content=message)]})
-    return result["messages"][-1].content
+    return _as_text(result["messages"][-1].content)

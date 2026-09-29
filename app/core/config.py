@@ -35,7 +35,8 @@ class Settings:
 def get_settings() -> Settings:
     """Read settings from the environment, failing clearly if misconfigured."""
     provider = os.getenv("LLM_PROVIDER", "mock").lower()
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    default_model = "gemini-flash-lite-latest" if provider == "gemini" else "gpt-4o-mini"
+    model = os.getenv("LLM_MODEL", default_model)
     api_key = os.getenv("LLM_API_KEY")
     github_pat = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
     github_toolsets = os.getenv("GITHUB_TOOLSETS", "repos,issues,pull_requests")
