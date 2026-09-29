@@ -53,4 +53,11 @@ def get_llm(settings: Settings) -> ChatModel:
 
         return ChatOpenAI(model=settings.llm_model, api_key=settings.llm_api_key)
 
+    if settings.llm_provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(
+            model=settings.llm_model, google_api_key=settings.llm_api_key
+        )
+
     raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")

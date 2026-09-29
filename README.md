@@ -2,9 +2,11 @@
 
 ## Current Phase
 
-**Phase 3 — GitHub MCP.** The agent can now discover and call tools from
-a separate GitHub MCP server process, in addition to its local Phase 2
-tool. Read-only only.
+**Phase 3 — GitHub MCP + Gemini LLM support.** The agent can now discover
+and call tools from a separate GitHub MCP server process, in addition to
+its local Phase 2 tool (read-only only). It also supports Google Gemini
+as an LLM provider alongside OpenAI and the mock model, so the full
+tool-calling loop can be tested for free.
 
 ## Current Architecture
 
@@ -15,7 +17,7 @@ FastAPI          (app/api/routes.py, async)
   ↓
 LangGraph        (app/agent/graph.py: START -> agent -> (tool?) -> END)
   ↓
-LLM              (app/agent/llm.py: mock or OpenAI, chosen by env var)
+LLM              (app/agent/llm.py: mock, OpenAI, or Gemini, chosen by env var)
   ↓
 local tool (app/agent/tools.py) or GitHub MCP tool (app/agent/mcp_tools.py)
   ↓
@@ -41,7 +43,7 @@ app/
 │   ├── state.py        LangGraph state (AgentState: messages history)
 │   ├── nodes.py         agent_node (calls the LLM) + tool_node (runs tools)
 │   ├── graph.py          Builds the graph: agent -> (tool?) -> agent -> END
-│   ├── llm.py             LLM provider abstraction (mock / openai)
+│   ├── llm.py             LLM provider abstraction (mock / openai / gemini)
 │   ├── tools.py            The Phase 2 local tool: get_project_info()
 │   └── mcp_tools.py         Phase 3: discovers tools from github-mcp-server
 └── core/config.py      Env-based settings, fails clearly if misconfigured
@@ -63,13 +65,26 @@ cp .env.example .env
 ```
 
 The default `.env` uses `LLM_PROVIDER=mock`, so the app runs with no API
-key. To use a real model, set:
+key. To use a real model, set one of:
 
 ```bash
 LLM_PROVIDER=openai
 LLM_MODEL=gpt-4o-mini
 LLM_API_KEY=sk-...
 ```
+
+```bash
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-flash-lite-latest
+LLM_API_KEY=<your Google AI Studio API key>
+```
+
+Gemini is a good default for local testing: Google AI Studio issues a
+free API key with no billing setup, so the full tool-calling loop can be
+exercised end-to-end at no cost. `gemini-flash-lite-latest` is used
+because it supports `bind_tools()`/real tool calling and isn't subject to
+the very low daily quota some pinned Gemini model versions have on the
+free tier.
 
 If `LLM_PROVIDER` is set to anything other than `mock` and `LLM_API_KEY`
 is missing, the server returns a clear configuration error instead of a
@@ -195,7 +210,7 @@ deterministically exercise both branches of the graph. Run with `pytest`.
 To verify against a real model, set `LLM_PROVIDER=openai` and a real
 `LLM_API_KEY` in `.env`, then use the Postman requests above.
 
-## Phase 3 — GitHub MCP
+## Phase 3 — GitHub MCP + Gemini LLM support
 
 ### What changed vs. Phase 2
 
@@ -275,5 +290,32 @@ flow through the identical `tool_node` code path.
 monkeypatched in the same way as Phase 2's fakes, so the "LLM picks an
 MCP tool, tool executes, result comes back" loop is proven without
 spawning a container or calling GitHub. Run with `pytest`.
+
+### Gemini LLM provider
+
+`LLM_PROVIDER=gemini` (`app/agent/llm.py`) uses LangChain's
+`ChatGoogleGenerativeAI`, which supports `.bind_tools()` and real tool
+calling the same way `ChatOpenAI` does - `agent_node`/`tool_node` don't
+need to know or care which provider is behind `get_llm()`.
+
+One real difference: OpenAI/mock return `AIMessage.content` as a plain
+string, but Gemini returns it as a list of content blocks (e.g.
+`[{"type": "text", "text": "..."}]`). `run_agent()` in
+`app/agent/graph.py` normalizes both shapes into a plain string before
+it reaches the FastAPI response model, so `/api/agent/run` always
+returns `{ "response": "<string>" }` regardless of provider.
+
+**Verified live** with `LLM_PROVIDER=gemini` /
+`LLM_MODEL=gemini-flash-lite-latest`, through the actual FastAPI
+endpoint (Postman and curl), Docker Desktop running the real
+`github-mcp-server` container, and a real GitHub PAT:
+
+- Gemini correctly requests GitHub MCP tools (e.g. `search_repositories`)
+  when a prompt needs one, and answers directly when it doesn't.
+- Tool results (real GitHub API data) are fed back to Gemini and used in
+  its final answer.
+- `/api/agent/run` returns real data end-to-end, e.g. asking for the most
+  starred repo in the `torvalds` org correctly returned `torvalds/linux`
+  with its live star count.
 
 Filesystem MCP will be introduced in Phase 4.
