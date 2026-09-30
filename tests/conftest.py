@@ -13,3 +13,10 @@ def disable_github_mcp(monkeypatch):
     the real github-mcp-server container.
     """
     monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+
+
+@pytest.fixture(autouse=True)
+def disable_filesystem_mcp(monkeypatch):
+    """Force Filesystem MCP off for every test, regardless of what's in the
+    developer's local .env - see disable_github_mcp above for why."""
+    monkeypatch.setenv("FILESYSTEM_MCP_ENABLED", "false")

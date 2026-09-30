@@ -2,11 +2,12 @@
 
 ## Current Phase
 
-**Phase 3 — GitHub MCP + Gemini LLM support.** The agent can now discover
-and call tools from a separate GitHub MCP server process, in addition to
-its local Phase 2 tool (read-only only). It also supports Google Gemini
-as an LLM provider alongside OpenAI and the mock model, so the full
-tool-calling loop can be tested for free.
+**Phase 4 — Filesystem MCP.** The agent can now discover and call tools
+from two separate MCP servers - GitHub and a filesystem server scoped to
+this project directory, both read-only - on top of its local Phase 2
+tool. It also supports Google Gemini as an LLM provider alongside OpenAI
+and the mock model, so the full tool-calling loop can be tested for
+free.
 
 ## Current Architecture
 
@@ -19,7 +20,8 @@ LangGraph        (app/agent/graph.py: START -> agent -> (tool?) -> END)
   ↓
 LLM              (app/agent/llm.py: mock, OpenAI, or Gemini, chosen by env var)
   ↓
-local tool (app/agent/tools.py) or GitHub MCP tool (app/agent/mcp_tools.py)
+local tool (app/agent/tools.py), GitHub MCP tool, or Filesystem MCP tool
+(app/agent/mcp_tools.py)
   ↓
 Response
 ```
@@ -27,7 +29,6 @@ Response
 ## Future Architecture (not implemented yet)
 
 ```text
-Filesystem MCP
 Docker
 Kubernetes
 GCP
@@ -45,7 +46,8 @@ app/
 │   ├── graph.py          Builds the graph: agent -> (tool?) -> agent -> END
 │   ├── llm.py             LLM provider abstraction (mock / openai / gemini)
 │   ├── tools.py            The Phase 2 local tool: get_project_info()
-│   └── mcp_tools.py         Phase 3: discovers tools from github-mcp-server
+│   └── mcp_tools.py         Discovers tools from github-mcp-server (Phase 3)
+│                             and mcp/filesystem (Phase 4)
 └── core/config.py      Env-based settings, fails clearly if misconfigured
 tests/                 pytest suite (uses the mock LLM, no API key needed)
 run.py                 Dev server entrypoint
@@ -318,4 +320,84 @@ endpoint (Postman and curl), Docker Desktop running the real
   starred repo in the `torvalds` org correctly returned `torvalds/linux`
   with its live star count.
 
-Filesystem MCP will be introduced in Phase 4.
+## Phase 4 — Filesystem MCP
+
+### What changed vs. Phase 3
+
+Same pattern as GitHub MCP, one more entry in the connections dict:
+`app/agent/mcp_tools.py` now passes both `github` and `filesystem` server
+configs to a single `MultiServerMCPClient`, and `get_mcp_tools()` returns
+the combined tool list from whichever servers are enabled.
+`agent_node`/`tool_node` need no changes - they already treat "a tool" as
+a tool regardless of where it came from.
+
+### Server and mount
+
+Uses the official `mcp/filesystem` image
+(`modelcontextprotocol/servers`), launched the same way as
+`github-mcp-server`: `app/agent/mcp_tools.py` runs
+`docker run -i --rm --mount type=bind,src=<repo root>,dst=/projects/mcp-tool-calling-agent,ro mcp/filesystem /projects/mcp-tool-calling-agent`.
+
+Two things are hardcoded, not env-configurable:
+
+- The mount source is computed from `__file__` at runtime (always this
+  repo's own root, wherever it's checked out) - it can never be pointed
+  at another directory by editing `.env`.
+- The mount uses the Docker `,ro` flag, so writes fail at the OS level
+  (`EROFS: read-only file system`) even if a write tool were somehow
+  invoked.
+
+### Read-only tool allowlist
+
+Unlike `github-mcp-server`, the filesystem server has no `--read-only`
+flag of its own - it always exposes mutating tools
+(`write_file`, `edit_file`, `move_file`, `create_directory`). Those are
+filtered out in `mcp_tools.py` before the tool list ever reaches
+`bind_tools()`, so the LLM can't even see or request them. What's left,
+and confirmed exposed by the pulled image:
+`read_file`, `read_multiple_files`, `list_directory`, `directory_tree`,
+`search_files`, `get_file_info`, `list_allowed_directories`. (The
+allowlist also includes the newer
+`read_text_file`/`read_media_file`/`list_directory_with_sizes` names in
+case a future image update renames `read_file`.)
+
+This is defense in depth on top of the Docker mount above: two
+independent layers (LLM never sees the write tools; the mount rejects
+writes at the kernel level even if it did) rather than relying on either
+alone.
+
+### Setup
+
+```bash
+FILESYSTEM_MCP_ENABLED=true
+```
+
+Off by default, unlike GitHub MCP (which is gated by whether a PAT is
+set) - the filesystem server needs no secret, so it needs an explicit
+opt-in instead, keeping `pytest` and default dev runs Docker-free unless
+asked for.
+
+### Postman
+
+Same endpoint, `POST http://localhost:8000/api/agent/run`.
+
+```json
+{ "message": "Use the filesystem tool to read requirements.txt and list its first 3 lines." }
+```
+
+**Verified live**, same way as Phase 3's Gemini + GitHub MCP check:
+Gemini called `list_allowed_directories` then `read_file` on this
+project's actual `requirements.txt`, and answered using the real file
+contents. A direct call to `write_file` (bypassing the app-level
+allowlist entirely, to test the mount itself) failed with
+`EROFS: read-only file system`, confirming the OS-level enforcement
+independent of the Python filtering.
+
+### Testing without Docker
+
+`tests/conftest.py` forces `FILESYSTEM_MCP_ENABLED=false` for every test
+run, the same way it forces GitHub MCP off, so `pytest` never spawns
+either container.
+
+No new dependencies were needed for this phase - `langchain-mcp-adapters`
+already supported multiple servers in one `MultiServerMCPClient`.
