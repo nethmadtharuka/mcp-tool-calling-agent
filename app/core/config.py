@@ -19,6 +19,7 @@ class Settings:
     llm_api_key: str | None
     github_pat: str | None
     github_toolsets: str
+    filesystem_mcp_enabled: bool
 
     @property
     def mock_mode(self) -> bool:
@@ -40,6 +41,10 @@ def get_settings() -> Settings:
     api_key = os.getenv("LLM_API_KEY")
     github_pat = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
     github_toolsets = os.getenv("GITHUB_TOOLSETS", "repos,issues,pull_requests")
+    # Off by default: unlike GitHub MCP (gated by needing a PAT), the
+    # filesystem server needs no secret, so it needs an explicit opt-in to
+    # avoid every `pytest`/dev run silently trying to spawn Docker.
+    filesystem_mcp_enabled = os.getenv("FILESYSTEM_MCP_ENABLED", "false").lower() == "true"
 
     if provider != "mock" and not api_key:
         raise ConfigError(
@@ -54,4 +59,5 @@ def get_settings() -> Settings:
         llm_api_key=api_key,
         github_pat=github_pat,
         github_toolsets=github_toolsets,
+        filesystem_mcp_enabled=filesystem_mcp_enabled,
     )
