@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage
 
 from fastapi.testclient import TestClient
 
+import app.agent.graph as graph
 import app.agent.nodes as nodes
 from app.agent.graph import run_agent
 from app.main import app
@@ -136,3 +137,114 @@ async def test_mcp_tool_call_required(monkeypatch):
 
     result = await run_agent("List open issues in octocat/Hello-World")
     assert "2 open issues in Hello-World" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: multi-step. The LLM chains several tool calls - across different
+# MCP servers - feeding each result back before deciding the next step.
+# ---------------------------------------------------------------------------
+
+
+class FakeMcpTool:
+    """Stands in for a tool discovered from an MCP server; records calls."""
+
+    def __init__(self, name, result, calls):
+        self.name = name
+        self._result = result
+        self._calls = calls
+
+    async def ainvoke(self, args):
+        self._calls.append(self.name)
+        return self._result
+
+
+class ScriptedLLM:
+    """Requests each planned tool in turn, one per LLM turn, then answers
+    with every tool result it has seen. Records each turn's history."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.seen = []
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages):
+        self.seen.append(list(messages))
+        results = [m.content for m in messages if m.type == "tool"]
+        if len(results) < len(self.plan):
+            name = self.plan[len(results)]
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": name, "args": {}, "id": f"call_{len(results)}"}],
+            )
+        return AIMessage(content="Summary: " + " | ".join(results))
+
+
+def _use_fakes(monkeypatch, llm, mcp_tools):
+    monkeypatch.setattr(nodes, "get_llm", lambda settings: llm)
+
+    async def fake_get_mcp_tools(settings):
+        return mcp_tools
+
+    monkeypatch.setattr(nodes, "get_mcp_tools", fake_get_mcp_tools)
+
+
+async def test_multiple_sequential_tool_calls(monkeypatch):
+    calls = []
+    tools = [
+        FakeMcpTool("list_directory", "README.md, app/", calls),
+        FakeMcpTool("read_file", "# Production-Oriented AI Engineering Agent", calls),
+    ]
+    llm = ScriptedLLM(["list_directory", "read_file"])
+    _use_fakes(monkeypatch, llm, tools)
+
+    result = await run_agent("List the files, then read README.md")
+
+    assert calls == ["list_directory", "read_file"]
+    # LLM ran 3 times, and each turn saw the previous tool's result.
+    assert len(llm.seen) == 3
+    assert [m.content for m in llm.seen[1] if m.type == "tool"] == ["README.md, app/"]
+    assert result == "Summary: README.md, app/ | # Production-Oriented AI Engineering Agent"
+
+
+async def test_tools_from_different_mcp_servers_in_one_request(monkeypatch):
+    calls = []
+    tools = [
+        FakeMcpTool("read_file", "README says Phase 4", calls),  # filesystem server
+        FakeMcpTool("get_repository", "repo: mcp-tool-calling-agent", calls),  # github server
+    ]
+    _use_fakes(monkeypatch, ScriptedLLM(["read_file", "get_repository"]), tools)
+
+    result = await run_agent("Read README.md and then check the GitHub repository")
+
+    assert calls == ["read_file", "get_repository"]
+    assert "README says Phase 4" in result
+    assert "repo: mcp-tool-calling-agent" in result
+
+
+class AlwaysCallsToolLLM:
+    """Never produces a final answer - would loop forever without a cap."""
+
+    def __init__(self):
+        self.turns = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages):
+        self.turns += 1
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "get_project_info", "args": {}, "id": f"call_{self.turns}"}],
+        )
+
+
+async def test_step_limit_stops_infinite_tool_loop(monkeypatch):
+    llm = AlwaysCallsToolLLM()
+    monkeypatch.setattr(nodes, "get_llm", lambda settings: llm)
+
+    result = await run_agent("loop forever")
+
+    assert f"limit of {graph.MAX_TOOL_STEPS} tool steps" in result
+    assert llm.turns == graph.MAX_TOOL_STEPS + 1  # 8 round trips + the turn that hit the cap
