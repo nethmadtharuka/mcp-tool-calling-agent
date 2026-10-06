@@ -6,6 +6,7 @@ definitions are NOT written by us - they're fetched at runtime from
 separate processes (the MCP servers) that we launch over stdio.
 """
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -25,6 +26,10 @@ _tools_cache: list | None = None
 # hardcoded, so the mount always tracks wherever this repo actually lives,
 # but it can never point anywhere else.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Covers starting the Docker container and the MCP handshake. Generous
+# because the first run may need to pull the image.
+_DISCOVERY_TIMEOUT_SECONDS = 60
 
 # The filesystem MCP server has no --read-only flag of its own (unlike
 # github-mcp-server), so read-only is enforced two ways: the Docker mount
@@ -74,24 +79,32 @@ def _github_server_config(settings: Settings) -> dict:
     }
 
 
+# Never visible inside the filesystem MCP container (compared lowercase).
+_HIDDEN_FROM_FILESYSTEM_MCP = frozenset({".env"})
+
+
 def _filesystem_server_config(settings: Settings) -> dict:
     mount_dst = "/projects/mcp-tool-calling-agent"
+    # Each top-level entry is bind-mounted on its own, skipping .env, so
+    # the secrets file simply doesn't exist in the container. Mounting the
+    # whole root and overlaying an empty file on .env is NOT enough: on a
+    # Windows host .ENV/.Env still resolve to the real file through the
+    # case-insensitive bind mount.
+    # ponytail: entries are listed when the config is built; a top-level
+    # file added later is visible only after an app restart.
+    mounts = []
+    for entry in sorted(_PROJECT_ROOT.iterdir()):
+        if entry.name.lower() in _HIDDEN_FROM_FILESYSTEM_MCP:
+            continue
+        # ,ro is hardcoded here, not read from an env var, so this
+        # project's files can never be accidentally mounted writable by
+        # misconfiguring .env.
+        mounts += ["--mount", f"type=bind,src={entry},dst={mount_dst}/{entry.name},ro"]
     return {
         "filesystem": {
             "transport": "stdio",
             "command": "docker",
-            "args": [
-                "run",
-                "-i",
-                "--rm",
-                # ,ro is hardcoded here, not read from an env var, so this
-                # project's directory can never be accidentally mounted
-                # writable by misconfiguring .env.
-                "--mount",
-                f"type=bind,src={_PROJECT_ROOT},dst={mount_dst},ro",
-                "mcp/filesystem",
-                mount_dst,
-            ],
+            "args": ["run", "-i", "--rm", *mounts, "mcp/filesystem", mount_dst],
         }
     }
 
@@ -125,19 +138,31 @@ async def get_mcp_tools(settings: Settings) -> list:
 
     client = MultiServerMCPClient(connections)
     tools = []
+    all_ok = True
 
-    if "github" in connections:
-        tools += await client.get_tools(server_name="github")
+    # Each server is optional: if one is down (Docker not running, image
+    # missing, handshake fails), log it and carry on with the others.
+    for server_name in connections:
+        try:
+            server_tools = await asyncio.wait_for(
+                client.get_tools(server_name=server_name), _DISCOVERY_TIMEOUT_SECONDS
+            )
+        except Exception:
+            all_ok = False
+            logger.warning(
+                "%s MCP server unavailable, continuing without its tools",
+                server_name,
+                exc_info=True,
+            )
+            continue
+        if server_name == "filesystem":
+            server_tools = [t for t in server_tools if t.name in _FILESYSTEM_READONLY_TOOLS]
+        tools += server_tools
 
-    if "filesystem" in connections:
-        fs_tools = await client.get_tools(server_name="filesystem")
-        tools += [t for t in fs_tools if t.name in _FILESYSTEM_READONLY_TOOLS]
+    logger.info("Discovered %d MCP tool(s): %s", len(tools), [t.name for t in tools])
 
-    _tools_cache = tools
-    logger.info(
-        "Discovered %d MCP tool(s): %s",
-        len(_tools_cache),
-        [t.name for t in _tools_cache],
-    )
-
-    return _tools_cache
+    # ponytail: a failed server is retried on every agent/tool node call
+    # (fast when Docker is simply down). Add a backoff if that gets noisy.
+    if all_ok:
+        _tools_cache = tools
+    return tools

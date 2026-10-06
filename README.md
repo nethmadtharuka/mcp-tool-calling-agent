@@ -2,12 +2,13 @@
 
 ## Current Phase
 
-**Phase 4 — Filesystem MCP.** The agent can now discover and call tools
-from two separate MCP servers - GitHub and a filesystem server scoped to
-this project directory, both read-only - on top of its local Phase 2
-tool. It also supports Google Gemini as an LLM provider alongside OpenAI
-and the mock model, so the full tool-calling loop can be tested for
-free.
+**Phase 6 — Basic Hardening.** The agent chains several tool calls per
+request (Phase 5) across its local Phase 2 tool and two read-only MCP
+servers - GitHub and a filesystem server scoped to this project
+directory, with `.env` hidden from it. LLM, MCP, tool and configuration
+failures now end in a controlled response or a clean HTTP error instead
+of a crash, and secrets are kept out of logs and API errors. Supported
+LLM providers: Google Gemini, OpenAI, and the mock model.
 
 ## Current Architecture
 
@@ -16,7 +17,7 @@ Client
   ↓
 FastAPI          (app/api/routes.py, async)
   ↓
-LangGraph        (app/agent/graph.py: START -> agent -> (tool?) -> END)
+LangGraph        (app/agent/graph.py: agent <-> tool loop, max 8 tool steps)
   ↓
 LLM              (app/agent/llm.py: mock, OpenAI, or Gemini, chosen by env var)
   ↓
@@ -43,11 +44,12 @@ app/
 ├── agent/
 │   ├── state.py        LangGraph state (AgentState: messages history)
 │   ├── nodes.py         agent_node (calls the LLM) + tool_node (runs tools)
-│   ├── graph.py          Builds the graph: agent -> (tool?) -> agent -> END
+│   ├── graph.py          Builds the graph: agent <-> tool loop, step limit
 │   ├── llm.py             LLM provider abstraction (mock / openai / gemini)
 │   ├── tools.py            The Phase 2 local tool: get_project_info()
 │   └── mcp_tools.py         Discovers tools from github-mcp-server (Phase 3)
-│                             and mcp/filesystem (Phase 4)
+│                             and mcp/filesystem (Phase 4); one failing
+│                             server doesn't take down the others (Phase 6)
 └── core/config.py      Env-based settings, fails clearly if misconfigured
 tests/                 pytest suite (uses the mock LLM, no API key needed)
 run.py                 Dev server entrypoint
@@ -107,8 +109,15 @@ python run.py
 pytest
 ```
 
-Tests run against the mock LLM, so no API key or network access is
-required.
+Tests run against the mock LLM and fake tools/MCP servers, so no API
+key, Docker, or network access is required.
+
+One opt-in test starts the real `mcp/filesystem` container and checks
+that `README.md` is readable while `.env` is not (requires Docker):
+
+```bash
+DOCKER_TESTS=1 pytest -k real_filesystem_mcp
+```
 
 ## Example Request
 
@@ -185,8 +194,9 @@ If the LLM doesn't need the tool, the list is just
 Same as Phase 1: `python run.py`, then `POST /api/agent/run`. Watch the
 terminal - `app/agent/nodes.py` logs each step with the stdlib `logging`
 module (`Calling LLM...`, `LLM requested tool call(s): [...]`,
-`Executing tool '...'`, `Tool '...' result: ...`, or `LLM answered
-directly, no tool call requested`).
+`Executing tool '...'`, `Tool '...' returned N chars`, or `LLM answered
+directly, no tool call requested`). Since Phase 6 only the *length* of a
+tool result is logged, never its content - see Phase 6 below.
 
 ### Postman
 
@@ -283,7 +293,7 @@ GitHub MCP tool:
 
 Watch server logs - same log lines as Phase 2
 (`Calling LLM...` / `LLM requested tool call(s): [...]` /
-`Executing tool '...'` / `Tool '...' result: ...`), because MCP tools
+`Executing tool '...'` / `Tool '...' returned N chars`), because MCP tools
 flow through the identical `tool_node` code path.
 
 ### Testing without Docker or a real GitHub token
@@ -336,14 +346,16 @@ a tool regardless of where it came from.
 Uses the official `mcp/filesystem` image
 (`modelcontextprotocol/servers`), launched the same way as
 `github-mcp-server`: `app/agent/mcp_tools.py` runs
-`docker run -i --rm --mount type=bind,src=<repo root>,dst=/projects/mcp-tool-calling-agent,ro mcp/filesystem /projects/mcp-tool-calling-agent`.
+`docker run -i --rm --mount type=bind,src=<repo root>/<entry>,dst=/projects/mcp-tool-calling-agent/<entry>,ro ... mcp/filesystem /projects/mcp-tool-calling-agent`,
+with one `--mount` per top-level entry of the repo, except `.env`
+(see Phase 6 - `.env` protection).
 
 Two things are hardcoded, not env-configurable:
 
-- The mount source is computed from `__file__` at runtime (always this
-  repo's own root, wherever it's checked out) - it can never be pointed
+- The mount sources are computed from `__file__` at runtime (always this
+  repo's own root, wherever it's checked out) - they can never be pointed
   at another directory by editing `.env`.
-- The mount uses the Docker `,ro` flag, so writes fail at the OS level
+- Every mount uses the Docker `,ro` flag, so writes fail at the OS level
   (`EROFS: read-only file system`) even if a write tool were somehow
   invoked.
 
@@ -401,3 +413,123 @@ either container.
 
 No new dependencies were needed for this phase - `langchain-mcp-adapters`
 already supported multiple servers in one `MultiServerMCPClient`.
+
+## Phase 5 — Multi-step Agent
+
+### What changed vs. Phase 4
+
+The `tool -> agent` edge in `app/agent/graph.py` already looped, so the
+LLM can call a tool, read the result, call another tool, and so on
+before answering - e.g. `list_directory`, then `read_file` on what it
+found, then a GitHub tool, all in one request. Each tool result is
+appended to the message history, so every LLM turn sees everything
+gathered so far.
+
+```text
+START -> agent -> (tool_calls?) -> tool -> agent -> (tool_calls?) -> tool -> ... -> agent -> END
+```
+
+### Multiple MCP servers in one run
+
+Tools from the local Phase 2 tool, GitHub MCP and Filesystem MCP are
+bound to the LLM together, so a single request can mix them freely
+(e.g. read `README.md` from the filesystem server, then look up the repo
+on GitHub). `tool_node` doesn't care which server a tool came from.
+
+### Step limit: `MAX_TOOL_STEPS = 8`
+
+A model that never stops requesting tools would otherwise loop forever.
+`app/agent/graph.py` caps a request at **8 agent -> tool round trips**
+(LangGraph `recursion_limit = 2 * MAX_TOOL_STEPS + 1`: two nodes per
+round trip plus the final answering turn). When the cap is hit,
+`GraphRecursionError` is caught and the API returns a normal `200`
+response:
+
+```json
+{ "response": "Stopped: reached the limit of 8 tool steps without a final answer." }
+```
+
+The limit is a hardcoded constant, not an env var.
+
+### Testing
+
+`tests/test_agent.py` uses a scripted fake LLM and fake MCP tools to
+prove: two sequential tool calls where each turn sees the previous
+result; tools from two different MCP servers in one request; and an LLM
+that always requests a tool being stopped after exactly 8 round trips.
+
+## Phase 6 — Basic Hardening
+
+### Error handling
+
+| Failure | Behavior |
+|---|---|
+| Missing `LLM_API_KEY` / unsupported `LLM_PROVIDER` | `500` with a clear configuration message (no secret in it) |
+| LLM provider call fails (network, auth, quota, model error) | `agent_node` raises `LLMError`; API returns `502` with a generic message, full traceback in the server log |
+| Any other unexpected error | `500` with a generic message, full traceback in the server log |
+| An MCP server is unavailable (Docker down, image missing, handshake fails or takes > 60s) | Logged as a warning and skipped; the agent keeps working with the remaining tools |
+| A tool raises (bad arguments, MCP tool failure, unexpected exception) | Error text is returned to the LLM as the tool result, so it can recover or explain |
+| A tool takes longer than 60s | Cancelled; `Error: tool '...' timed out after 60s` is returned to the LLM |
+| Malformed tool call (provider couldn't parse the arguments) | Reported back to the LLM as an error tool result so it can retry; still counts toward `MAX_TOOL_STEPS` |
+| Unknown tool name | `Error: unknown tool '...'` returned to the LLM |
+
+API errors never include raw exception text, which could carry internal
+details; that only goes to the server log. The success response shape is
+unchanged: `{ "response": "..." }`.
+
+MCP discovery results are cached only when every enabled server
+succeeded, so a server that was down is retried on later calls instead
+of staying missing until restart.
+
+### Safe logging
+
+Logged: each LLM call, requested tool names, tool execution, tool
+failures/timeouts, malformed tool calls, unavailable MCP servers, LLM
+failures, and the step limit being reached.
+
+Never logged: `LLM_API_KEY`, `GITHUB_PERSONAL_ACCESS_TOKEN`, or tool
+result *contents* - only their length (`Tool '...' returned N chars`).
+Tool results can be file contents read via Filesystem MCP, so logging
+them could copy file data into server logs.
+
+### `.env` protection
+
+`.env` holds the LLM API key and GitHub PAT, and it lives in the project
+root - which is exactly what Filesystem MCP exposes. Instead of mounting
+the root as a single directory, `app/agent/mcp_tools.py` now bind-mounts
+each top-level entry separately (all `,ro`) and skips `.env`, so the
+file **does not exist inside the container** - no tool call, path trick,
+or prompt can reach it.
+
+A single root mount with an empty file mounted over `.env` was tested
+and rejected: on a Windows host the bind mount is case-insensitive, so
+`.ENV` / `.Env` still opened the real file. With per-entry mounts, the
+container's `/projects/mcp-tool-calling-agent` directory is a plain
+Linux directory, and `.env`, `.ENV`, `.Env`, `app/../.env` and the
+Windows short name `ENV~1` all fail with `ENOENT` (verified against the
+real container). `.env.example` (placeholders only) stays readable.
+
+Limitation: the list of top-level entries is read when the tools are
+first discovered, so a top-level file added later is visible to the
+filesystem server only after an app restart.
+
+### Read-only protections (unchanged)
+
+- GitHub MCP: `--read-only` is hardcoded in `app/agent/mcp_tools.py`,
+  not configurable by env var.
+- Filesystem MCP: every Docker mount is `,ro`, and the hardcoded tool
+  allowlist keeps `write_file`, `edit_file`, `move_file` and
+  `create_directory` away from the LLM.
+- Neither can be changed by editing `.env`.
+
+### Testing
+
+All Phase 6 tests use fake LLMs, fake tools, and a fake MCP client - no
+API key, Docker, or network. They cover: LLM failure (`LLMError` and a
+clean `502`), unexpected errors (clean `500` without internal details),
+missing API key and unsupported provider, a crashing MCP tool, a tool
+timeout, invalid tool arguments, a malformed tool call, one MCP server
+down while the other still works (with the PAT absent from the logs),
+the read-only allowlist and `,ro` mounts, and `.env` being excluded from
+the filesystem mounts. The opt-in `DOCKER_TESTS=1` test repeats the
+`.env` check against the real container.

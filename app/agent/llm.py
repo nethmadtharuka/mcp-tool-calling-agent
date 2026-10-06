@@ -8,7 +8,11 @@ from typing import Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage
 
-from app.core.config import Settings
+from app.core.config import ConfigError, Settings
+
+
+class LLMError(Exception):
+    """The LLM provider call failed (network, auth, quota, model error...)."""
 
 
 class ChatModel(Protocol):
@@ -60,4 +64,4 @@ def get_llm(settings: Settings) -> ChatModel:
             model=settings.llm_model, google_api_key=settings.llm_api_key
         )
 
-    raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
+    raise ConfigError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")

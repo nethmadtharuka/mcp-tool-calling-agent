@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 #APIRouter-this make us to group related API endpoints together
 #pydantic is used for the data validation 
 from app.agent.graph import run_agent  
+from app.agent.llm import LLMError
 from app.core.config import ConfigError
 
 router = APIRouter()
@@ -30,11 +31,19 @@ async def run(request: AgentRunRequest) -> AgentRunResponse:
         response = await run_agent(request.message)
     except ConfigError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:
-        logging.exception("Agent execution failed")
+    except LLMError as exc:
+        logging.exception("LLM call failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Agent failed: {exc}"
+            detail="The LLM provider request failed. See server logs for details."
+        ) from exc
+    except Exception as exc:
+        # Full traceback goes to the server log only; raw exception text
+        # can carry internal details, so the client gets a generic message.
+        logging.exception("Agent execution failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Agent failed due to an internal error. See server logs for details."
         ) from exc
 
     return AgentRunResponse(response=response)

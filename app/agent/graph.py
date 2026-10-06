@@ -32,7 +32,7 @@ _RECURSION_LIMIT = 2 * MAX_TOOL_STEPS + 1
 def route_after_agent(state: AgentState) -> str:
     """Conditional edge: inspect the last AIMessage to decide where to go next."""
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+    if last_message.tool_calls or last_message.invalid_tool_calls:
         return "tool"
     return "end"
 
