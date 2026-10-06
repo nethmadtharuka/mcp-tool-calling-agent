@@ -1,16 +1,20 @@
 """LangGraph node functions."""
 
+import asyncio
 import logging
 
 from langchain_core.messages import ToolMessage
 
-from app.agent.llm import get_llm
+from app.agent.llm import LLMError, get_llm
 from app.agent.mcp_tools import get_mcp_tools
 from app.agent.state import AgentState
 from app.agent.tools import AVAILABLE_TOOLS
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# A hung MCP server (or any tool) must not hang the whole request.
+TOOL_TIMEOUT_SECONDS = 60
 
 
 async def _get_all_tools() -> list:
@@ -36,13 +40,19 @@ async def agent_node(state: AgentState) -> AgentState:
     llm = get_llm(get_settings()).bind_tools(tools)
 
     logger.info("Calling LLM with %d message(s) in history", len(state["messages"]))
-    ai_message = await llm.ainvoke(state["messages"])
+    try:
+        ai_message = await llm.ainvoke(state["messages"])
+    except Exception as exc:
+        # Full traceback is logged once, by the API layer.
+        raise LLMError(f"LLM request failed ({type(exc).__name__})") from exc
 
     if ai_message.tool_calls:
         names = [call["name"] for call in ai_message.tool_calls]
         logger.info("LLM requested tool call(s): %s", names)
     else:
         logger.info("LLM answered directly, no tool call requested")
+    if ai_message.invalid_tool_calls:
+        logger.warning("LLM produced %d malformed tool call(s)", len(ai_message.invalid_tool_calls))
 
     return {"messages": [ai_message]}
 
@@ -73,11 +83,30 @@ async def tool_node(state: AgentState) -> AgentState:
             content = f"Error: unknown tool '{name}'"
         else:
             try:
-                content = str(await tool_fn.ainvoke(args))
+                result = await asyncio.wait_for(tool_fn.ainvoke(args), TOOL_TIMEOUT_SECONDS)
+                content = str(result)
+            except TimeoutError:
+                content = f"Error: tool '{name}' timed out after {TOOL_TIMEOUT_SECONDS}s"
             except Exception as exc:  # tool crashed or got bad arguments
                 content = f"Error executing '{name}': {exc}"
 
-        logger.info("Tool '%s' result: %s", name, content)
+        if content.startswith("Error"):
+            logger.warning("Tool '%s' failed: %s", name, content)
+        else:
+            # Length only: results can be file contents (e.g. a .env read
+            # via filesystem MCP), which must not land in server logs.
+            logger.info("Tool '%s' returned %d chars", name, len(content))
         results.append(ToolMessage(content=content, tool_call_id=call_id))
+
+    # Calls the provider couldn't parse (bad JSON args etc.). Report them
+    # back so the LLM can retry; this still counts toward MAX_TOOL_STEPS.
+    for call in last_message.invalid_tool_calls:
+        logger.warning("Malformed tool call '%s': %s", call.get("name"), call.get("error"))
+        results.append(
+            ToolMessage(
+                content=f"Error: malformed call to '{call.get('name')}': {call.get('error')}",
+                tool_call_id=call.get("id") or "",
+            )
+        )
 
     return {"messages": results}
