@@ -1,0 +1,7 @@
+# Allowlist: everything is excluded unless re-included below, so a new
+# file (or .env, .git, .venv, caches) can never slip into the build context.
+*
+!app/
+!requirements.txt
+**/__pycache__
+**/*.py[cod]

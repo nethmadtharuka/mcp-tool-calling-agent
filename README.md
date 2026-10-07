@@ -30,7 +30,7 @@ Response
 ## Future Architecture (not implemented yet)
 
 ```text
-Docker
+Docker Compose   (Phase 7b: MCP servers as separate containers over HTTP)
 Kubernetes
 GCP
 ```
@@ -53,6 +53,10 @@ app/
 └── core/config.py      Env-based settings, fails clearly if misconfigured
 tests/                 pytest suite (uses the mock LLM, no API key needed)
 run.py                 Dev server entrypoint
+requirements.txt       Runtime dependencies, pinned (installed in the image)
+requirements-dev.txt   Runtime + test dependencies, pinned
+Dockerfile             Agent image (Phase 7)
+.dockerignore          Allowlist: only app/ and requirements.txt enter the build
 ```
 
 ## Setup
@@ -64,9 +68,13 @@ python -m venv .venv
 # macOS/Linux
 source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # runtime + test dependencies
 cp .env.example .env
 ```
+
+All dependency versions are pinned. `requirements.txt` holds only what
+the app needs at runtime (and is all the Docker image installs);
+`requirements-dev.txt` adds `pytest`, `pytest-asyncio` and `httpx`.
 
 The default `.env` uses `LLM_PROVIDER=mock`, so the app runs with no API
 key. To use a real model, set one of:
@@ -102,6 +110,42 @@ python run.py
 
 - API docs: http://localhost:8000/docs
 - Health check: http://localhost:8000/health
+
+## Docker
+
+Phase 7a containerizes the agent itself. MCP servers are not wired up
+inside the container yet (that's Phase 7b), so run it with
+`LLM_PROVIDER=mock` or a real LLM, without MCP.
+
+```bash
+docker build -t mcp-tool-calling-agent .
+
+docker run --rm --name agent   -p 127.0.0.1:8000:8000   --read-only --tmpfs /tmp   --cap-drop ALL --security-opt no-new-privileges   -e LLM_PROVIDER=mock   mcp-tool-calling-agent
+```
+
+Then `curl http://127.0.0.1:8000/health`. `docker ps` shows the
+container's health check status.
+
+- **Port**: published on `127.0.0.1` only, so it isn't reachable from
+  other machines on your network. Inside the container uvicorn binds
+  `0.0.0.0`, which is required for Docker port publishing to work.
+- **Non-root**: the app runs as user `app` (uid 10001). The code is owned
+  by root, so the app can't modify it.
+- **Read-only**: `--read-only` makes the container's root filesystem
+  read-only; `--tmpfs /tmp` gives it an in-memory scratch directory.
+- **No secrets in the image**: `.dockerignore` is an allowlist (only
+  `app/` and `requirements.txt` are sent to the build), so `.env`, `.git`
+  and `.venv` never reach the build context. Configuration comes from
+  environment variables at runtime.
+- **Real LLM**: pass `--env-file .env` instead of `-e LLM_PROVIDER=mock`.
+  Until Phase 7b, the container has no way to start the MCP servers: if
+  `.env` sets `GITHUB_PERSONAL_ACCESS_TOKEN` or
+  `FILESYSTEM_MCP_ENABLED=true`, they are logged as unavailable and
+  skipped (Phase 6 failure isolation), and the agent answers without them.
+  Values passed with `--env-file` are visible to anyone who can run
+  `docker inspect` on this machine.
+- **Base image**: `python:3.13-slim`, pinned by digest in the
+  `Dockerfile`. To update it, pull the new tag and replace the digest.
 
 ## Test
 

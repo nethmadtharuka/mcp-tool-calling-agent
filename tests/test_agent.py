@@ -478,3 +478,23 @@ async def test_real_filesystem_mcp_hides_env():
         # so a failure can never print the file's contents in the report.
         hidden = "ENOENT" in str(await read.ainvoke({"path": f"{root}/{name}"}))
         assert hidden, f"{name} is readable inside the container"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: the Gemini provider is lazily imported inside get_llm, so a
+# missing langchain-google-genai install only shows up at request time.
+# This catches it in the suite instead. No network: construction only.
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_provider_imports_and_constructs():
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    from app.agent.llm import get_llm
+
+    settings = Settings(
+        llm_provider="gemini", llm_model="gemini-flash-lite-latest",
+        llm_api_key="fake-key-for-test", github_pat=None,
+        github_toolsets="repos", filesystem_mcp_enabled=False,
+    )
+    assert isinstance(get_llm(settings), ChatGoogleGenerativeAI)
