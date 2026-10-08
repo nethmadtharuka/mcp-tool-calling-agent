@@ -1,0 +1,69 @@
+# Agent + its two MCP servers, each in its own container, talking
+# streamable HTTP. Only the agent is reachable from the host
+# (127.0.0.1:8000); docker-compose.dev.yml also publishes the MCP ports.
+#
+#   docker compose up -d --build
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+services:
+  agent:
+    build: .
+    <<: *hardening
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    environment:
+      # Overrides .env: in compose the filesystem server is always running.
+      FILESYSTEM_MCP_ENABLED: "true"
+      GITHUB_MCP_URL: http://github-mcp:8082/
+      FILESYSTEM_MCP_URL: http://filesystem-mcp:8000/mcp
+    tmpfs: [/tmp]
+    networks: [mcp-internal, egress]
+    depends_on: [github-mcp, filesystem-mcp]
+
+  github-mcp:
+    image: ghcr.io/github/github-mcp-server@sha256:ffced0d76e77428532a2ced185516992d77fd146d69eec2f244e6237d1a97796 # v2.0.2
+    <<: *hardening
+    # No token here: the agent sends its PAT per request in the
+    # Authorization header. --read-only can't be lifted by any header.
+    command: [http, --read-only]
+    user: "65532:65532"
+    restart: unless-stopped
+    mem_limit: 256m
+    networks: [egress] # needs api.github.com
+
+  filesystem-mcp:
+    build: ./filesystem-mcp
+    <<: *hardening
+    restart: unless-stopped
+    mem_limit: 256m
+    tmpfs: [/tmp]
+    # No internet: reachable only from the agent over mcp-internal.
+    networks: [mcp-internal]
+    # Listed one by one, all :ro. .env is deliberately absent; mounting
+    # the project root (or overlaying .env) would expose it, since on
+    # Windows .ENV/.Env resolve to the real file. .git and .venv skipped.
+    volumes:
+      - ./app:/projects/mcp-tool-calling-agent/app:ro
+      - ./tests:/projects/mcp-tool-calling-agent/tests:ro
+      - ./filesystem-mcp:/projects/mcp-tool-calling-agent/filesystem-mcp:ro
+      - ./README.md:/projects/mcp-tool-calling-agent/README.md:ro
+      - ./Dockerfile:/projects/mcp-tool-calling-agent/Dockerfile:ro
+      - ./docker-compose.yml:/projects/mcp-tool-calling-agent/docker-compose.yml:ro
+      - ./docker-compose.dev.yml:/projects/mcp-tool-calling-agent/docker-compose.dev.yml:ro
+      - ./.dockerignore:/projects/mcp-tool-calling-agent/.dockerignore:ro
+      - ./.env.example:/projects/mcp-tool-calling-agent/.env.example:ro
+      - ./.gitignore:/projects/mcp-tool-calling-agent/.gitignore:ro
+      - ./requirements.txt:/projects/mcp-tool-calling-agent/requirements.txt:ro
+      - ./requirements-dev.txt:/projects/mcp-tool-calling-agent/requirements-dev.txt:ro
+      - ./pytest.ini:/projects/mcp-tool-calling-agent/pytest.ini:ro
+      - ./run.py:/projects/mcp-tool-calling-agent/run.py:ro
+
+networks:
+  mcp-internal:
+    internal: true
+  egress: {}

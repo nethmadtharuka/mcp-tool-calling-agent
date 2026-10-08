@@ -20,6 +20,10 @@ class Settings:
     github_pat: str | None
     github_toolsets: str
     filesystem_mcp_enabled: bool
+    # Defaults are the docker-compose service names. Read from env only,
+    # never from anything the LLM produces.
+    github_mcp_url: str = "http://github-mcp:8082/"
+    filesystem_mcp_url: str = "http://filesystem-mcp:8000/mcp"
 
     @property
     def mock_mode(self) -> bool:
@@ -43,7 +47,8 @@ def get_settings() -> Settings:
     github_toolsets = os.getenv("GITHUB_TOOLSETS", "repos,issues,pull_requests")
     # Off by default: unlike GitHub MCP (gated by needing a PAT), the
     # filesystem server needs no secret, so it needs an explicit opt-in to
-    # avoid every `pytest`/dev run silently trying to spawn Docker.
+    # avoid every `pytest`/dev run silently trying to reach it.
+    # docker-compose.yml sets it to true for the agent container.
     filesystem_mcp_enabled = os.getenv("FILESYSTEM_MCP_ENABLED", "false").lower() == "true"
 
     if provider != "mock" and not api_key:
@@ -60,4 +65,6 @@ def get_settings() -> Settings:
         github_pat=github_pat,
         github_toolsets=github_toolsets,
         filesystem_mcp_enabled=filesystem_mcp_enabled,
+        github_mcp_url=os.getenv("GITHUB_MCP_URL", Settings.github_mcp_url),
+        filesystem_mcp_url=os.getenv("FILESYSTEM_MCP_URL", Settings.filesystem_mcp_url),
     )

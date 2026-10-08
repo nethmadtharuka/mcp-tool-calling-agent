@@ -256,8 +256,11 @@ async def test_step_limit_stops_infinite_tool_loop(monkeypatch):
 # ---------------------------------------------------------------------------
 
 import asyncio  # noqa: E402
+import dataclasses  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
+import yaml  # noqa: E402
 
 from langchain_core.messages.tool import invalid_tool_call  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
@@ -401,7 +404,7 @@ def _fake_mcp_client(monkeypatch, github_fails):
         async def get_tools(self, server_name):
             if server_name == "github":
                 if github_fails:
-                    raise FileNotFoundError("docker not found")
+                    raise ConnectionError("github-mcp unreachable")
                 return [FakeDiscoveredTool("get_repository")]  # --read-only server
             names = ["read_file", "list_directory", "write_file", "edit_file",
                      "move_file", "create_directory"]
@@ -442,42 +445,90 @@ async def test_readonly_protections_intact(monkeypatch):
     names = {t.name for t in tools}
     assert names == {"get_repository", "read_file", "list_directory"}
     assert names.isdisjoint({"write_file", "edit_file", "move_file", "create_directory"})
-    assert "--read-only" in mcp_tools._github_server_config(settings)["github"]["args"]
-    fs_args = mcp_tools._filesystem_server_config(settings)["filesystem"]["args"]
-    mounts = [a for a in fs_args if a.startswith("type=bind,")]
-    assert mounts and all(m.endswith(",ro") for m in mounts)
+    github = mcp_tools._github_server_config(settings)["github"]
+    assert github["headers"]["X-MCP-Readonly"] == "true"
+    assert github["url"] == "http://github-mcp:8082/"  # compose service name, from config only
 
 
-def test_env_file_not_mounted_into_filesystem_mcp():
-    args = mcp_tools._filesystem_server_config(_both_servers_settings())["filesystem"]["args"]
-    mounts = [a for a in args if a.startswith("type=bind,")]
-    mounted_names = {m.split(",dst=")[1].removesuffix(",ro").rsplit("/", 1)[1] for m in mounts}
+# --- docker-compose.yml is where mounts and read-only now live ---
 
-    assert "README.md" in mounted_names
-    assert ".env.example" in mounted_names  # placeholders only, safe to read
-    assert not any(name.lower() == ".env" for name in mounted_names)
-    # No mount may expose the project root itself (that would include .env).
-    assert not any(f"src={mcp_tools._PROJECT_ROOT}," in m for m in mounts)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MCP_SERVICES = ("github-mcp", "filesystem-mcp")
 
 
-# Opt-in: talks to the real mcp/filesystem container. Run with
+def _compose(name="docker-compose.yml"):
+    return yaml.safe_load((_REPO_ROOT / name).read_text())["services"]
+
+
+def _volume_paths(service):
+    for v in service.get("volumes", []):
+        src, dst, *mode = v.split(":")  # short syntax only; long syntax fails here loudly
+        yield src, dst, mode
+
+
+def test_compose_never_mounts_env_and_mounts_read_only():
+    for file in ("docker-compose.yml", "docker-compose.dev.yml"):
+        for name, svc in _compose(file).items():
+            for src, dst, mode in _volume_paths(svc):
+                for path in (src, dst):
+                    assert Path(path).name.lower() != ".env", f"{file}:{name} mounts .env: {path}"
+                # Mounting the project root (or any parent) would expose .env.
+                assert src.rstrip("/") not in (".", "..", ""), f"{file}:{name} mounts the project root"
+                assert mode == ["ro"], f"{file}:{name} mount {src} is not :ro"
+
+    fs_mounts = {Path(dst).name for _, dst, _ in _volume_paths(_compose()["filesystem-mcp"])}
+    assert {"README.md", "app", ".env.example"} <= fs_mounts  # placeholders only, safe to read
+
+
+def test_compose_mcp_services_locked_down():
+    services = _compose()
+    for name in _MCP_SERVICES:
+        svc = services[name]
+        assert "ports" not in svc, f"{name} publishes ports"
+        assert "env_file" not in svc, f"{name} gets the .env secrets"
+        assert svc.get("read_only") is True, f"{name} rootfs is writable"
+        assert svc.get("cap_drop") == ["ALL"], name
+        assert "no-new-privileges:true" in svc.get("security_opt", []), name
+        assert svc.get("mem_limit"), name
+    assert "--read-only" in services["github-mcp"]["command"]
+    assert services["filesystem-mcp"]["networks"] == ["mcp-internal"]  # no internet
+
+    agent = services["agent"]
+    assert agent["read_only"] is True
+    assert all(p.startswith("127.0.0.1:") for p in agent["ports"])
+    # Dev override may only publish on localhost.
+    for svc in _compose("docker-compose.dev.yml").values():
+        assert all(p.startswith("127.0.0.1:") for p in svc.get("ports", []))
+
+
+# Opt-in: talks to the real filesystem-mcp container. Start it first with
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 #   DOCKER_TESTS=1 pytest -k real_filesystem_mcp
 @pytest.mark.skipif(os.getenv("DOCKER_TESTS") != "1", reason="set DOCKER_TESTS=1 to run")
 async def test_real_filesystem_mcp_hides_env():
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    client = MultiServerMCPClient(mcp_tools._filesystem_server_config(_both_servers_settings()))
+    settings = dataclasses.replace(
+        _both_servers_settings(),
+        filesystem_mcp_url=os.getenv("FILESYSTEM_MCP_URL", "http://127.0.0.1:8001/mcp"),
+    )
+    client = MultiServerMCPClient(mcp_tools._filesystem_server_config(settings))
     tools = {t.name: t for t in await client.get_tools(server_name="filesystem")}
     read = tools.get("read_text_file") or tools["read_file"]
     root = "/projects/mcp-tool-calling-agent"
 
     assert "Production-Oriented AI Engineering Agent" in str(await read.ainvoke({"path": f"{root}/README.md"}))
 
+    # The server reports errors as text, not exceptions. Reduce to a bool
+    # so a failure can never print the file's contents in the report.
     for name in [".env", ".ENV", ".Env", "app/../.env"]:
-        # The server reports errors as text, not exceptions. Reduce to a bool
-        # so a failure can never print the file's contents in the report.
         hidden = "ENOENT" in str(await read.ainvoke({"path": f"{root}/{name}"}))
         assert hidden, f"{name} is readable inside the container"
+
+    # The agent never gets write_file (allowlist), but the mount must
+    # refuse it anyway.
+    result = str(await tools["write_file"].ainvoke({"path": f"{root}/probe.txt", "content": "x"}))
+    assert "EROFS" in result, "filesystem mount is writable"
 
 
 # ---------------------------------------------------------------------------

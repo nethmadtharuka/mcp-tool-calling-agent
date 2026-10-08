@@ -2,7 +2,10 @@
 
 ## Current Phase
 
-**Phase 6 — Basic Hardening.** The agent chains several tool calls per
+**Phase 7b — Docker Compose.** The agent and its two MCP servers run as
+separate containers talking streamable HTTP (see [Docker](#docker)).
+
+Before that, **Phase 6 — Basic Hardening**: the agent chains several tool calls per
 request (Phase 5) across its local Phase 2 tool and two read-only MCP
 servers - GitHub and a filesystem server scoped to this project
 directory, with `.env` hidden from it. LLM, MCP, tool and configuration
@@ -21,8 +24,8 @@ LangGraph        (app/agent/graph.py: agent <-> tool loop, max 8 tool steps)
   ↓
 LLM              (app/agent/llm.py: mock, OpenAI, or Gemini, chosen by env var)
   ↓
-local tool (app/agent/tools.py), GitHub MCP tool, or Filesystem MCP tool
-(app/agent/mcp_tools.py)
+local tool (app/agent/tools.py), or over streamable HTTP
+(app/agent/mcp_tools.py) to the github-mcp or filesystem-mcp container
   ↓
 Response
 ```
@@ -30,7 +33,6 @@ Response
 ## Future Architecture (not implemented yet)
 
 ```text
-Docker Compose   (Phase 7b: MCP servers as separate containers over HTTP)
 Kubernetes
 GCP
 ```
@@ -57,6 +59,9 @@ requirements.txt       Runtime dependencies, pinned (installed in the image)
 requirements-dev.txt   Runtime + test dependencies, pinned
 Dockerfile             Agent image (Phase 7)
 .dockerignore          Allowlist: only app/ and requirements.txt enter the build
+docker-compose.yml     Agent + github-mcp + filesystem-mcp (Phase 7b)
+docker-compose.dev.yml Dev override: also publishes the MCP ports on 127.0.0.1
+filesystem-mcp/        mcp/filesystem fronted by supergateway (stdio -> HTTP)
 ```
 
 ## Setup
@@ -113,39 +118,89 @@ python run.py
 
 ## Docker
 
-Phase 7a containerizes the agent itself. MCP servers are not wired up
-inside the container yet (that's Phase 7b), so run it with
-`LLM_PROVIDER=mock` or a real LLM, without MCP.
+Phase 7b runs the agent and both MCP servers with Docker Compose, each in
+its own container, talking MCP over streamable HTTP:
 
 ```bash
-docker build -t mcp-tool-calling-agent .
-
-docker run --rm --name agent   -p 127.0.0.1:8000:8000   --read-only --tmpfs /tmp   --cap-drop ALL --security-opt no-new-privileges   -e LLM_PROVIDER=mock   mcp-tool-calling-agent
+cp .env.example .env          # set LLM_* and GITHUB_PERSONAL_ACCESS_TOKEN
+docker compose up -d --build
+curl http://127.0.0.1:8000/health
 ```
 
-Then `curl http://127.0.0.1:8000/health`. `docker ps` shows the
-container's health check status.
+```text
+host 127.0.0.1:8000 -> agent --egress-------> github-mcp -> api.github.com
+                           \--mcp-internal--> filesystem-mcp (no internet)
+```
 
-- **Port**: published on `127.0.0.1` only, so it isn't reachable from
-  other machines on your network. Inside the container uvicorn binds
-  `0.0.0.0`, which is required for Docker port publishing to work.
-- **Non-root**: the app runs as user `app` (uid 10001). The code is owned
-  by root, so the app can't modify it.
-- **Read-only**: `--read-only` makes the container's root filesystem
-  read-only; `--tmpfs /tmp` gives it an in-memory scratch directory.
-- **No secrets in the image**: `.dockerignore` is an allowlist (only
-  `app/` and `requirements.txt` are sent to the build), so `.env`, `.git`
-  and `.venv` never reach the build context. Configuration comes from
-  environment variables at runtime.
-- **Real LLM**: pass `--env-file .env` instead of `-e LLM_PROVIDER=mock`.
-  Until Phase 7b, the container has no way to start the MCP servers: if
-  `.env` sets `GITHUB_PERSONAL_ACCESS_TOKEN` or
-  `FILESYSTEM_MCP_ENABLED=true`, they are logged as unavailable and
-  skipped (Phase 6 failure isolation), and the agent answers without them.
-  Values passed with `--env-file` are visible to anyone who can run
-  `docker inspect` on this machine.
-- **Base image**: `python:3.13-slim`, pinned by digest in the
-  `Dockerfile`. To update it, pull the new tag and replace the digest.
+| Service | Image | Notes |
+|---|---|---|
+| `agent` | built from `Dockerfile` | the only service with a published port (`127.0.0.1:8000`) and the only one that gets `.env` |
+| `github-mcp` | `ghcr.io/github/github-mcp-server` v2.0.2, pinned by digest | `http --read-only`; holds no token, the agent sends it per request |
+| `filesystem-mcp` | built from `filesystem-mcp/Dockerfile` | `mcp/filesystem` (stdio only) fronted by `supergateway` 4.1.0 |
+
+- **MCP URLs**: the agent reads `GITHUB_MCP_URL` and `FILESYSTEM_MCP_URL`,
+  defaulting to the compose service names. They come from the environment
+  only, never from LLM output.
+- **GitHub auth**: the agent sends `Authorization: Bearer <PAT>`,
+  `X-MCP-Readonly: true` and `X-MCP-Toolsets: $GITHUB_TOOLSETS` on every
+  request. The server is started with `--read-only`, which no header can
+  undo. `GITHUB_TOOLSETS` can only narrow the server's default toolsets
+  (`context, copilot, issues, pull_requests, repos, users`); anything else,
+  e.g. `actions`, silently yields no tools.
+- **Filesystem sessions**: supergateway runs in stateful mode, one
+  `mcp/filesystem` child process per MCP session. A session left open by a
+  client that died is reaped after `--sessionTimeout` (60 s).
+- **Filesystem mounts**: listed one by one in `docker-compose.yml`, all
+  `:ro`. `.env` is never mounted, so reading it (or `.ENV`, `.Env`) returns
+  `ENOENT`, and writes return `EROFS`. `.git` and `.venv` aren't mounted
+  either. The agent's read-only tool allowlist in `mcp_tools.py` still
+  applies on top.
+- **Hardening, every service**: non-root (`agent` uid 10001, `github-mcp`
+  65532, `filesystem-mcp` 1000), `read_only` rootfs, `cap_drop: ALL`,
+  `no-new-privileges`. MCP services also get `restart: unless-stopped`
+  and a 256 MB memory limit, and no published ports or `env_file`.
+- **Networks**: `mcp-internal` is `internal: true` (no internet), shared by
+  the agent and `filesystem-mcp`. `egress` is shared by the agent (for the
+  LLM API) and `github-mcp`.
+- **Secrets**: `.dockerignore` is an allowlist, so `.env`, `.git` and
+  `.venv` never reach the agent's build context. `.env` values passed via
+  `env_file` are visible to anyone who can run `docker inspect`.
+- **One server down**: stop either MCP container and the agent logs it as
+  unavailable and answers with the remaining tools (Phase 6).
+
+### Dev: reaching the MCP servers from the host
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+```
+
+This also publishes `github-mcp` on `127.0.0.1:8082` and `filesystem-mcp`
+on `127.0.0.1:8001`. To run the agent on the host (`python run.py`)
+against them, set `GITHUB_MCP_URL=http://127.0.0.1:8082/` and
+`FILESYSTEM_MCP_URL=http://127.0.0.1:8001/mcp`.
+
+### Updating pinned versions
+
+Every image and package is pinned so rebuilds are identical. To update one,
+pull the new tag and read its digest:
+
+```bash
+docker pull <image>:<tag>
+docker image inspect <image>:<tag> --format '{{index .RepoDigests 0}}'
+```
+
+| What | Pinned in |
+|---|---|
+| `python:3.13-slim` | `Dockerfile` |
+| `ghcr.io/github/github-mcp-server` | `docker-compose.yml` (also update the `# vX.Y.Z` comment) |
+| `mcp/filesystem` | `filesystem-mcp/Dockerfile` |
+| `supergateway` (npm, `npm view supergateway version`) | `filesystem-mcp/Dockerfile` |
+
+Replace the old `sha256:...` (or version), then
+`docker compose up -d --build` and run the checks in [Test](#test). Also
+check that the new github-mcp-server still lists no write tools under
+`--read-only`, and that the filesystem server's tool names are still
+covered by `_FILESYSTEM_READONLY_TOOLS` in `app/agent/mcp_tools.py`.
 
 ## Test
 
@@ -156,10 +211,16 @@ pytest
 Tests run against the mock LLM and fake tools/MCP servers, so no API
 key, Docker, or network access is required.
 
-One opt-in test starts the real `mcp/filesystem` container and checks
-that `README.md` is readable while `.env` is not (requires Docker):
+The compose tests parse `docker-compose.yml` and fail if `.env` appears
+in any mount, any mount isn't `:ro`, or any MCP service publishes ports,
+gets `env_file`, or has a writable rootfs.
+
+One opt-in test talks to the real `filesystem-mcp` container and checks
+that `README.md` is readable, `.env`/`.ENV`/`.Env` return `ENOENT`, and
+writes return `EROFS` (requires Docker):
 
 ```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 DOCKER_TESTS=1 pytest -k real_filesystem_mcp
 ```
 

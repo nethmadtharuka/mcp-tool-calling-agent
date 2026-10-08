@@ -1,0 +1,21 @@
+# Dev only: also publish the MCP servers on 127.0.0.1, so `python run.py`
+# and DOCKER_TESTS=1 pytest on the host can reach them.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Then on the host: GITHUB_MCP_URL=http://127.0.0.1:8082/
+#                   FILESYSTEM_MCP_URL=http://127.0.0.1:8001/mcp
+
+services:
+  github-mcp:
+    ports:
+      - "127.0.0.1:8082:8082"
+
+  filesystem-mcp:
+    ports:
+      - "127.0.0.1:8001:8000"
+    # Ports aren't published from an internal-only network.
+    networks: [mcp-internal, dev-host]
+
+networks:
+  dev-host: {}
