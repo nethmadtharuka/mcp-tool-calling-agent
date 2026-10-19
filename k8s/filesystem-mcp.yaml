@@ -1,0 +1,67 @@
+# mcp/filesystem behind supergateway (streamable HTTP), serving the
+# read-only project snapshot baked into filesystem-mcp/Dockerfile.k8s.
+# Locally built image: fixed tag + IfNotPresent, so this works unchanged
+# on Docker Desktop (shares the Docker image store) and on kind (after
+# `kind load docker-image filesystem-mcp-k8s:0.1.0`).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: filesystem-mcp
+  namespace: mcp-agent
+spec:
+  # supergateway --stateful keeps each MCP session in one pod's memory: a
+  # second replica would get requests for sessions it doesn't know.
+  replicas: 1
+  # ...and Recreate so a rollout never runs old and new pods side by side.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: filesystem-mcp}
+  template:
+    metadata:
+      labels: {app: filesystem-mcp}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: filesystem-mcp
+          image: filesystem-mcp-k8s:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8000}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        # compose's `tmpfs: [/tmp]`
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 16Mi}
+---
+# In-cluster name `filesystem-mcp:8000` - the default FILESYSTEM_MCP_URL
+# (http://filesystem-mcp:8000/mcp) in app/core/config.py.
+apiVersion: v1
+kind: Service
+metadata:
+  name: filesystem-mcp
+  namespace: mcp-agent
+spec:
+  type: ClusterIP
+  selector: {app: filesystem-mcp}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

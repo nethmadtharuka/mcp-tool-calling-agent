@@ -1,0 +1,35 @@
+# Opt-in: only when LLM_PROVIDER is a real model (gemini/openai). Not
+# needed for mock, so not applied by default (`kubectl apply -f k8s/`
+# doesn't read this folder).
+#
+#   kubectl --context kind-mcp-agent apply -f k8s/optional/agent-llm-egress.yaml
+#
+# NetworkPolicy (and open-source Calico) can only match IPs, not hostnames.
+# LLM APIs sit behind large, shared, changing cloud ranges (Google's alone
+# is ~100 CIDRs shared with every Google service), so pinning IPs would be
+# both brittle and barely narrower. This allows HTTPS to the public
+# internet and nothing private: no cluster, node or API-server address.
+# For hostname-level control (only generativelanguage.googleapis.com),
+# route through an egress proxy with a domain allowlist.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-llm-egress
+  namespace: mcp-agent
+spec:
+  podSelector:
+    matchLabels: {app: agent}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: TCP, port: 443}
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8       # includes the Service range (API server VIP)
+              - 172.16.0.0/12    # includes the kind node (API server)
+              - 192.168.0.0/16   # pod network
+              - 100.64.0.0/10
+              - 169.254.0.0/16   # link-local / cloud metadata
+              - 127.0.0.0/8

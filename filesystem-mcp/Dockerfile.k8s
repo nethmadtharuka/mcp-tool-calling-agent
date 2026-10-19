@@ -1,0 +1,26 @@
+# Kubernetes variant of ./Dockerfile. Compose bind-mounts the project
+# live; a cluster can't (the node isn't your disk), so this image bakes a
+# read-only snapshot of the project in instead. Rebuild after editing files.
+#
+# Build from the repo root (the snapshot needs it as context):
+#   docker build -f filesystem-mcp/Dockerfile.k8s -t filesystem-mcp-k8s:0.1.0 .
+#
+# Dockerfile.k8s.dockerignore (next to this file) replaces the root
+# .dockerignore for this build: an allowlist, so .env, .git, .venv and any
+# new file stay out unless listed there.
+FROM mcp/filesystem@sha256:35fcf0217ca0d5bf7b0a5bd68fb3b89e08174676c0e0b4f431604512cf7b3f67
+
+RUN npm install -g supergateway@4.1.0 && npm cache clean --force
+
+# Owned by root, so the server (uid 1000) can read but never change it -
+# on top of the read-only rootfs in k8s/filesystem-mcp.yaml.
+COPY . /projects/mcp-tool-calling-agent
+
+# node, numeric so Kubernetes can verify runAsNonRoot.
+USER 1000:1000
+
+EXPOSE 8000
+ENTRYPOINT ["supergateway", \
+    "--stdio", "node /app/dist/index.js /projects/mcp-tool-calling-agent", \
+    "--outputTransport", "streamableHttp", "--stateful", \
+    "--sessionTimeout", "60000", "--port", "8000"]

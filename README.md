@@ -638,3 +638,245 @@ down while the other still works (with the PAT absent from the logs),
 the read-only allowlist and `,ro` mounts, and `.env` being excluded from
 the filesystem mounts. The opt-in `DOCKER_TESTS=1` test repeats the
 `.env` check against the real container.
+
+## Phase 8 — Kubernetes (in progress)
+
+Runs on Docker Desktop's built-in Kubernetes (Settings -> Kubernetes ->
+Enable, Kubeadm; context `docker-desktop`). Docker Compose keeps working
+alongside it.
+
+**This cluster does not enforce NetworkPolicy** (verified: a deny-all
+policy is accepted but blocks nothing). Network isolation (8f) therefore
+runs on a second, local kind + Calico cluster; on `docker-desktop`,
+don't rely on in-cluster network isolation.
+
+### 8b — namespace, config, secrets
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml
+python k8s/create_secret.py        # re-run after changing a key in .env
+```
+
+- `k8s/namespace.yaml`: namespace `mcp-agent` with `restricted` Pod
+  Security - the cluster rejects pods that run as root, keep
+  capabilities or allow privilege escalation.
+- `k8s/configmap.yaml`: non-secret settings. `LLM_PROVIDER=mock`, so
+  cluster runs make no paid LLM calls. MCP URLs aren't set: the
+  `config.py` defaults are the Service names.
+- `k8s/create_secret.py`: Secret `agent-secrets` with only
+  `LLM_API_KEY` and `GITHUB_PERSONAL_ACCESS_TOKEN` from `.env`, piped to
+  kubectl on stdin (never in arguments, history or a file). Uses
+  server-side apply so the values aren't also stored in an annotation.
+  Kubernetes Secrets are base64, not encrypted: anyone with
+  `kubectl get secret` access in the namespace can read them.
+
+`tests/test_k8s.py` checks these files statically (no cluster needed).
+
+### 8c — github-mcp
+
+```bash
+kubectl apply -f k8s/github-mcp.yaml
+kubectl -n mcp-agent rollout status deploy/github-mcp
+```
+
+Same as the compose service: pinned v2.0.2 digest, `http --read-only`,
+no token (the agent sends its PAT per request), uid 65532, read-only
+rootfs, no capabilities, 256Mi limit. Added for Kubernetes: no
+service-account token, `RuntimeDefault` seccomp, and TCP readiness and
+liveness probes on 8082 (the server has no documented health endpoint).
+The `github-mcp` ClusterIP Service gives it the in-cluster name
+`github-mcp:8082`, which is the default `GITHUB_MCP_URL`; nothing outside
+the cluster can reach it.
+
+To talk to it from the host for debugging (localhost only, stop with Ctrl+C):
+
+```bash
+kubectl -n mcp-agent port-forward svc/github-mcp 18082:8082
+```
+
+`tests/test_k8s.py` checks every Deployment under `k8s/` for the
+hardening above, and that every Service is ClusterIP.
+
+### 8d — filesystem-mcp
+
+```bash
+docker build -f filesystem-mcp/Dockerfile.k8s -t filesystem-mcp-k8s:0.1.0 .
+kubectl apply -f k8s/filesystem-mcp.yaml
+kubectl -n mcp-agent rollout status deploy/filesystem-mcp
+```
+
+Compose bind-mounts the project live; a cluster can't (the node isn't
+your disk), so Kubernetes uses its own image, `filesystem-mcp/Dockerfile.k8s`,
+with a **read-only snapshot** of the project baked in.
+`filesystem-mcp/Dockerfile` and Compose are unchanged.
+
+- **What goes in**: `Dockerfile.k8s.dockerignore` (BuildKit uses it instead
+  of the root `.dockerignore` for this build) is an allowlist of the same
+  entries Compose mounts, plus `k8s/`. `.env`, `.git`, `.venv` and
+  `build.log` are never in the image, so reading them fails whatever the
+  path or case.
+- **Read-only twice**: the snapshot is owned by root (the server runs as
+  uid 1000) and the root filesystem is read-only. `/tmp` is a 16Mi
+  in-memory `emptyDir`.
+- **Same base and pins as Compose**: `mcp/filesystem` digest and
+  `supergateway@4.1.0`; `tests/test_k8s.py` fails if the two Dockerfiles
+  drift apart.
+- **One replica, `Recreate` rollouts**: supergateway's `--stateful`
+  sessions live in one pod's memory, so two pods must never serve at once.
+- **Locally built image**: fixed tag `filesystem-mcp-k8s:0.1.0` and
+  `imagePullPolicy: IfNotPresent`. Docker Desktop's cluster shares the
+  Docker image store; kind needs `kind load docker-image filesystem-mcp-k8s:0.1.0`.
+- **Updating the snapshot**: after editing project files, rebuild with a
+  new tag, update it in `k8s/filesystem-mcp.yaml`, and `kubectl apply`.
+  (Rebuilding the same tag also works on Docker Desktop, followed by
+  `kubectl -n mcp-agent rollout restart deploy/filesystem-mcp`.)
+
+The `filesystem-mcp` ClusterIP Service gives it the in-cluster name
+`filesystem-mcp:8000`, matching the default `FILESYSTEM_MCP_URL`
+(`http://filesystem-mcp:8000/mcp`). For host debugging:
+`kubectl -n mcp-agent port-forward svc/filesystem-mcp 18001:8000`.
+
+### 8e — agent
+
+```bash
+docker build -t mcp-agent:0.1.0 .
+kubectl apply -f k8s/agent.yaml
+kubectl -n mcp-agent rollout status deploy/agent
+kubectl -n mcp-agent port-forward svc/agent 8000:8000   # localhost only; Ctrl+C to stop
+curl http://127.0.0.1:8000/health
+```
+
+(Stop Compose first, or forward to another local port such as
+`18000:8000`; Compose already uses 127.0.0.1:8000.)
+
+- **Image**: the same `Dockerfile` and `.dockerignore` as Compose (only
+  `app/` and `requirements.txt` go in), built with a fixed tag. No
+  Kubernetes-specific Dockerfile is needed. kind: `kind load docker-image mcp-agent:0.1.0`.
+- **Config**: `envFrom` the `agent-config` ConfigMap (`LLM_PROVIDER=mock`).
+  `LLM_API_KEY` and `GITHUB_PERSONAL_ACCESS_TOKEN` come from the
+  `agent-secrets` Secret via `secretKeyRef`, into this pod only. MCP URLs
+  aren't set: the `config.py` defaults are the Service names.
+- **Hardening**: uid 10001 (the image's `app` user, group from the image),
+  read-only root filesystem, 16Mi in-memory `/tmp`, no capabilities, no
+  privilege escalation, `RuntimeDefault` seccomp, no service-account
+  token, 512Mi limit (~127Mi used).
+- **Probes**: HTTP `GET /health` (`app/api/routes.py`). It doesn't check
+  the MCP servers on purpose: the agent keeps answering without them (Phase 6).
+
+**Rebuild and roll out after code changes:** bump the tag so the change
+is explicit and easy to roll back:
+
+```bash
+docker build -t mcp-agent:0.1.1 .
+kubectl -n mcp-agent set image deploy/agent agent=mcp-agent:0.1.1
+kubectl -n mcp-agent rollout status deploy/agent
+# then update the tag in k8s/agent.yaml so the file matches the cluster
+kubectl -n mcp-agent rollout undo deploy/agent   # if it goes wrong
+```
+
+With `LLM_PROVIDER=mock` the LLM never calls a tool, so a request only
+proves MCP *discovery* (the log shows `Discovered 29 MCP tool(s)`). To use a
+real model, set `LLM_PROVIDER` in `k8s/configmap.yaml`, `kubectl apply` it,
+then `kubectl -n mcp-agent rollout restart deploy/agent` (env vars are
+read at pod start).
+
+**Not enforced on Docker Desktop** (verified): any pod can reach the
+MCP servers and the agent, and filesystem-mcp can reach the internet.
+Compose blocks both. This is what 8f fixes, on a cluster that enforces
+NetworkPolicy. The agent already can't use the Kubernetes API: without
+a service-account token it gets `403`.
+
+### 8f — network isolation (kind + Calico)
+
+Docker Desktop's cluster accepts NetworkPolicy but ignores it, so the
+isolation runs on a second, local **kind** cluster with **Calico**, which
+enforces it. Both clusters live side by side as kubectl contexts:
+`docker-desktop` and `kind-mcp-agent`. Always pass `--context`.
+
+Pinned: kind v0.33.0, node image `kindest/node:v1.34.11@sha256:44e2…`
+(in `k8s/kind/cluster.yaml`), Calico v3.32.2.
+
+**Create the cluster** (one time):
+
+```bash
+winget install --id Kubernetes.kind --version 0.33.0 --exact
+kind create cluster --config k8s/kind/cluster.yaml
+kubectl config use-context docker-desktop   # kind switches the default context; switch it back
+K="--context kind-mcp-agent"
+kubectl $K create -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.2/manifests/calico.yaml
+kubectl $K -n kube-system rollout status ds/calico-node
+```
+
+`create`, not `apply`: Calico's CRDs are too big for `apply`'s annotation.
+
+**Load the local images and deploy** (the manifests are unchanged from 8b–8e):
+
+```bash
+docker build -t mcp-agent:0.1.0 .
+docker build -f filesystem-mcp/Dockerfile.k8s -t filesystem-mcp-k8s:0.1.0 .
+kind load docker-image mcp-agent:0.1.0 filesystem-mcp-k8s:0.1.0 --name mcp-agent
+kubectl $K apply -f k8s/namespace.yaml -f k8s/configmap.yaml
+python k8s/create_secret.py $K
+kubectl $K apply -f k8s/github-mcp.yaml -f k8s/filesystem-mcp.yaml -f k8s/agent.yaml
+kubectl $K apply -f k8s/network-policies.yaml
+kubectl $K -n mcp-agent port-forward svc/agent 18000:8000
+```
+
+After a code change, rebuild with a new tag, `kind load` it, then
+`kubectl $K -n mcp-agent set image ...` (see 8e). kind can't see your
+Docker images until they're loaded.
+
+**Policies** (`k8s/network-policies.yaml`):
+
+| Pod | Ingress | Egress |
+|---|---|---|
+| all | denied by default | denied by default |
+| `agent` | none (see below) | `github-mcp:8082`, `filesystem-mcp:8000`, DNS |
+| `github-mcp` | `agent` only, port 8082 | GitHub API IP ranges, port 443 only; DNS |
+| `filesystem-mcp` | `agent` only, port 8000 | **none, not even DNS** |
+
+- **No pod can reach the Kubernetes API, the kubelet or kube-system**
+  except CoreDNS on port 53. Other namespaces can't reach any pod here.
+- **The agent has no ingress rule.** `kubectl port-forward` enters the
+  pod's own network namespace, and kubelet probes come from the node;
+  Calico allows both without a rule. Add a rule only when an Ingress
+  controller or another pod must call the agent.
+- **filesystem-mcp gets no DNS**: it never needs DNS, and DNS queries can
+  carry data out through CoreDNS's upstream resolver.
+- **Hostnames can't be matched.** NetworkPolicy and open-source Calico
+  match only IPs and labels (Calico's domain rules are Enterprise-only),
+  so:
+  - **github-mcp** is limited to the IPv4 ranges GitHub publishes for
+    its API (`api` in https://api.github.com/meta; this also covers
+    `raw.githubusercontent.com`). Those ranges change occasionally. If
+    GitHub tools start failing, refresh the list:
+    ```bash
+    curl -s https://api.github.com/meta | python -c "import json,sys,ipaddress; [print(f'        - ipBlock: {{cidr: {c}}}') for c in json.load(sys.stdin)['api'] if ipaddress.ip_network(c).version==4]"
+    ```
+    and replace the `ipBlock` lines in `k8s/network-policies.yaml`.
+  - **The agent gets no internet** with `LLM_PROVIDER=mock`. For a real
+    LLM, also apply `k8s/optional/agent-llm-egress.yaml`: HTTPS (443) to
+    any public IP, never to private, cluster, node or link-local
+    addresses. LLM APIs sit on large, shared cloud ranges, so pinning
+    their IPs would be brittle and barely narrower. Real hostname
+    filtering needs an egress proxy with a domain allowlist.
+- **Identity is the `app` label.** Anyone who can create pods in
+  `mcp-agent` can create one labelled `app=agent` and get its access.
+  Keep pod-creation rights in this namespace to yourself.
+
+**Verified on kind** (2026-10-19): a deny-all policy actually blocked
+traffic that worked before it was applied. With the real policies, the
+allowed paths work and 31 denied paths are blocked, each checked by IP
+against a target shown reachable from an unrestricted pod. The full
+`/api/agent/run` flow and real GitHub and filesystem tool calls work.
+`tests/test_k8s.py` checks the policies statically: default deny exists,
+no allow-all rules, `0.0.0.0/0` only in the optional LLM file, and every
+workload has its own ingress and egress policy.
+
+**Delete the kind cluster** (removes only the kind cluster and its context;
+Docker Desktop's cluster and Compose are untouched):
+
+```bash
+kind delete cluster --name mcp-agent
+```

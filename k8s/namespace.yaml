@@ -1,0 +1,11 @@
+# Everything for this project lives in one namespace. "restricted" Pod
+# Security makes the cluster refuse any pod that runs as root, keeps
+# capabilities, allows privilege escalation or mounts host paths - the
+# compose hardening, enforced instead of just configured.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-agent
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
