@@ -11,7 +11,9 @@ RUN npm install -g supergateway@4.1.0 && npm cache clean --force
 USER node
 
 EXPOSE 8000
+# /healthz answers "ok" without starting an MCP session (compose healthcheck).
 ENTRYPOINT ["supergateway", \
     "--stdio", "node /app/dist/index.js /projects/mcp-tool-calling-agent", \
     "--outputTransport", "streamableHttp", "--stateful", \
-    "--sessionTimeout", "60000", "--port", "8000"]
+    "--sessionTimeout", "60000", "--port", "8000", \
+    "--healthEndpoint", "/healthz"]

@@ -23,7 +23,12 @@ services:
       FILESYSTEM_MCP_URL: http://filesystem-mcp:8000/mcp
     tmpfs: [/tmp]
     networks: [mcp-internal, egress]
-    depends_on: [github-mcp, filesystem-mcp]
+    depends_on:
+      # github-mcp's image is distroless (just the server binary): there's
+      # no command a healthcheck could run, so only wait for it to start.
+      # The agent retries MCP discovery anyway (Phase 6).
+      github-mcp: {condition: service_started}
+      filesystem-mcp: {condition: service_healthy}
 
   github-mcp:
     image: ghcr.io/github/github-mcp-server@sha256:ffced0d76e77428532a2ced185516992d77fd146d69eec2f244e6237d1a97796 # v2.0.2
@@ -42,6 +47,12 @@ services:
     restart: unless-stopped
     mem_limit: 256m
     tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     # No internet: reachable only from the agent over mcp-internal.
     networks: [mcp-internal]
     # Listed one by one, all :ro. .env is deliberately absent; mounting
