@@ -1,0 +1,138 @@
+# Network isolation for mcp-agent - the compose networks, enforced by the
+# cluster. Needs a CNI that enforces NetworkPolicy (Calico on kind, see
+# k8s/kind/cluster.yaml); Docker Desktop accepts these but ignores them.
+#
+#   agent ------> github-mcp:8082 ----> GitHub API (443, GitHub's IPs)
+#     \---------> filesystem-mcp:8000   (no egress at all, not even DNS)
+#
+# Everything else is denied: other namespaces can't reach any pod here,
+# and no pod can reach the Kubernetes API or kube-system except DNS.
+# The agent gets no internet: LLM_PROVIDER=mock needs none. For a real
+# LLM, also apply k8s/optional/agent-llm-egress.yaml.
+
+# 1. Deny all ingress and egress for every pod in the namespace. The
+#    policies below are the only exceptions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: mcp-agent
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# 2. DNS, to CoreDNS only, for the pods that resolve names. Not for
+#    filesystem-mcp: it never needs DNS, and DNS queries can carry data out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: mcp-agent
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [agent, github-mcp]}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# 3. agent: talks only to the two MCP servers.
+#    No ingress rule: `kubectl port-forward` connects from inside the pod's
+#    own network namespace and kubelet probes come from the node, and
+#    Calico allows both without a rule - so nothing needs to reach the
+#    agent over the pod network. Add an ingress rule here only when an
+#    Ingress controller or another pod must call it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent
+  namespace: mcp-agent
+spec:
+  podSelector:
+    matchLabels: {app: agent}
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: github-mcp}
+      ports:
+        - {protocol: TCP, port: 8082}
+    - to:
+        - podSelector:
+            matchLabels: {app: filesystem-mcp}
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+# 4. github-mcp: called only by the agent; calls only the GitHub API.
+#    NetworkPolicy can't match hostnames, so egress is limited to the IPv4
+#    ranges GitHub publishes for its API (https://api.github.com/meta,
+#    "api" key; includes raw.githubusercontent.com's 185.199.108.0/22),
+#    port 443 only. These change occasionally: see README "8f" to refresh.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-mcp
+  namespace: mcp-agent
+spec:
+  podSelector:
+    matchLabels: {app: github-mcp}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: agent}
+      ports:
+        - {protocol: TCP, port: 8082}
+  egress:
+    - ports:
+        - {protocol: TCP, port: 443}
+      to:
+        # GitHub "api" IPv4 ranges, fetched 2026-10-19.
+        - ipBlock: {cidr: 192.30.252.0/22}
+        - ipBlock: {cidr: 185.199.108.0/22}
+        - ipBlock: {cidr: 140.82.112.0/20}
+        - ipBlock: {cidr: 143.55.64.0/20}
+        - ipBlock: {cidr: 20.201.28.148/32}
+        - ipBlock: {cidr: 20.205.243.168/32}
+        - ipBlock: {cidr: 20.87.245.6/32}
+        - ipBlock: {cidr: 4.237.22.34/32}
+        - ipBlock: {cidr: 4.228.31.149/32}
+        - ipBlock: {cidr: 20.207.73.85/32}
+        - ipBlock: {cidr: 20.27.177.116/32}
+        - ipBlock: {cidr: 20.200.245.245/32}
+        - ipBlock: {cidr: 20.175.192.149/32}
+        - ipBlock: {cidr: 20.233.83.146/32}
+        - ipBlock: {cidr: 20.29.134.17/32}
+        - ipBlock: {cidr: 20.199.39.228/32}
+        - ipBlock: {cidr: 20.217.135.0/32}
+        - ipBlock: {cidr: 4.225.11.201/32}
+        - ipBlock: {cidr: 4.208.26.200/32}
+        - ipBlock: {cidr: 20.26.156.210/32}
+        - ipBlock: {cidr: 172.182.252.137/32}
+        - ipBlock: {cidr: 4.249.131.166/32}
+        - ipBlock: {cidr: 48.202.248.39/32}
+        - ipBlock: {cidr: 48.204.201.2/32}
+---
+# 5. filesystem-mcp: called only by the agent; no egress at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: filesystem-mcp
+  namespace: mcp-agent
+spec:
+  podSelector:
+    matchLabels: {app: filesystem-mcp}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: agent}
+      ports:
+        - {protocol: TCP, port: 8000}

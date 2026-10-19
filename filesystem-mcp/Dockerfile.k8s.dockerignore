@@ -1,0 +1,21 @@
+# Allowlist for Dockerfile.k8s (BuildKit uses this instead of the root
+# .dockerignore). Same entries as the compose filesystem-mcp mounts, plus
+# k8s/. Never add .env, .git, .venv or build.log.
+*
+!app/
+!tests/
+!filesystem-mcp/
+!k8s/
+!README.md
+!Dockerfile
+!docker-compose.yml
+!docker-compose.dev.yml
+!.dockerignore
+!.env.example
+!.gitignore
+!requirements.txt
+!requirements-dev.txt
+!pytest.ini
+!run.py
+**/__pycache__
+**/*.py[cod]

@@ -1,0 +1,18 @@
+# Non-secret agent settings (the compose `environment:` + non-secret .env
+# values). Secrets live in the agent-secrets Secret, created by
+# k8s/create_secret.py - never in this file.
+#
+# GITHUB_MCP_URL / FILESYSTEM_MCP_URL are left unset: app/core/config.py
+# defaults to the Service names github-mcp and filesystem-mcp, which
+# resolve the same way in the cluster as in compose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: mcp-agent
+data:
+  # mock: cluster runs make no paid LLM calls. Set to gemini/openai (with
+  # LLM_API_KEY in the Secret) to use a real model.
+  LLM_PROVIDER: mock
+  FILESYSTEM_MCP_ENABLED: "true"
+  GITHUB_TOOLSETS: repos,issues,pull_requests

@@ -1,0 +1,60 @@
+# github-mcp-server, same as the compose service: pinned digest,
+# `http --read-only`, no token of its own (the agent sends its PAT per
+# request), non-root, read-only rootfs, no capabilities.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-mcp
+  namespace: mcp-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: github-mcp}
+  template:
+    metadata:
+      labels: {app: github-mcp}
+    spec:
+      # The server never talks to the Kubernetes API, so it gets no token for it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: github-mcp
+          image: ghcr.io/github/github-mcp-server@sha256:ffced0d76e77428532a2ced185516992d77fd146d69eec2f244e6237d1a97796 # v2.0.2
+          imagePullPolicy: IfNotPresent
+          # --read-only can't be lifted by any request header.
+          args: [http, --read-only]
+          ports:
+            - {name: http, containerPort: 8082}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          # No known health endpoint, so probe the port: ready once it
+          # accepts connections, restarted if it stops.
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+# Stable in-cluster name `github-mcp:8082` - the default GITHUB_MCP_URL in
+# app/core/config.py. ClusterIP only: not reachable from outside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-mcp
+  namespace: mcp-agent
+spec:
+  type: ClusterIP
+  selector: {app: github-mcp}
+  ports:
+    - {name: http, port: 8082, targetPort: http}
