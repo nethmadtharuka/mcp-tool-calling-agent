@@ -2,8 +2,10 @@
 
 ## Current Phase
 
-**Phase 7b — Docker Compose.** The agent and its two MCP servers run as
-separate containers talking streamable HTTP (see [Docker](#docker)).
+**Phase 8 — Kubernetes.** The same three services run on Kubernetes,
+with network isolation enforced on a local kind + Calico cluster (see
+[Phase 8](#phase-8--kubernetes)). Phase 7 runs them with Docker Compose,
+as separate containers talking streamable HTTP (see [Docker](#docker)).
 
 Before that, **Phase 6 — Basic Hardening**: the agent chains several tool calls per
 request (Phase 5) across its local Phase 2 tool and two read-only MCP
@@ -54,6 +56,9 @@ app/
 │                             server doesn't take down the others (Phase 6)
 └── core/config.py      Env-based settings, fails clearly if misconfigured
 tests/                 pytest suite (uses the mock LLM, no API key needed)
+├── test_live_docker.py  opt-in (DOCKER_TESTS=1): the running compose stack
+├── test_live_k8s.py     opt-in (K8S_TESTS=1): the running Kubernetes deployment
+└── live_probe.py        run inside the agent container/pod by both
 run.py                 Dev server entrypoint
 requirements.txt       Runtime dependencies, pinned (installed in the image)
 requirements-dev.txt   Runtime + test dependencies, pinned
@@ -61,7 +66,10 @@ Dockerfile             Agent image (Phase 7)
 .dockerignore          Allowlist: only app/ and requirements.txt enter the build
 docker-compose.yml     Agent + github-mcp + filesystem-mcp (Phase 7b)
 docker-compose.dev.yml Dev override: also publishes the MCP ports on 127.0.0.1
-filesystem-mcp/        mcp/filesystem fronted by supergateway (stdio -> HTTP)
+filesystem-mcp/        mcp/filesystem fronted by supergateway (stdio -> HTTP);
+                       Dockerfile.k8s bakes in a read-only project snapshot
+k8s/                   Kubernetes manifests (Phase 8); kind/ = local cluster
+                       config, optional/ = opt-in real-LLM egress policy
 ```
 
 ## Setup
@@ -79,7 +87,8 @@ cp .env.example .env
 
 All dependency versions are pinned. `requirements.txt` holds only what
 the app needs at runtime (and is all the Docker image installs);
-`requirements-dev.txt` adds `pytest`, `pytest-asyncio` and `httpx`.
+`requirements-dev.txt` adds `pytest`, `pytest-asyncio`, `httpx` and
+`pyyaml` (for the compose and Kubernetes manifest tests).
 
 The default `.env` uses `LLM_PROVIDER=mock`, so the app runs with no API
 key. To use a real model, set one of:
@@ -159,6 +168,12 @@ host 127.0.0.1:8000 -> agent --egress-------> github-mcp -> api.github.com
   65532, `filesystem-mcp` 1000), `read_only` rootfs, `cap_drop: ALL`,
   `no-new-privileges`. MCP services also get `restart: unless-stopped`
   and a 256 MB memory limit, and no published ports or `env_file`.
+- **Health checks**: `agent` checks `GET /health`; `filesystem-mcp` checks
+  supergateway's `/healthz` (answers without opening an MCP session), and
+  the agent starts only once it's healthy. `github-mcp` has none: its
+  image is distroless (only the server binary, no shell or HTTP client),
+  so there's no command a health check could run. The agent waits only
+  for it to start and retries discovery if it isn't ready yet (Phase 6).
 - **Networks**: `mcp-internal` is `internal: true` (no internet), shared by
   the agent and `filesystem-mcp`. `egress` is shared by the agent (for the
   LLM API) and `github-mcp`.
@@ -208,21 +223,57 @@ covered by `_FILESYSTEM_READONLY_TOOLS` in `app/agent/mcp_tools.py`.
 pytest
 ```
 
-Tests run against the mock LLM and fake tools/MCP servers, so no API
-key, Docker, or network access is required.
+**Unit and static tests** (always run): the mock LLM and fake tools/MCP
+servers, so no API key, Docker, or network access is needed. They also
+parse the deployment files: `docker-compose.yml` (no `.env` in any mount,
+every mount `:ro`, no MCP ports, no `env_file`, read-only rootfs) and
+everything under `k8s/` (hardening, Secret wiring, NetworkPolicies; see
+`tests/test_k8s.py`).
 
-The compose tests parse `docker-compose.yml` and fail if `.env` appears
-in any mount, any mount isn't `:ro`, or any MCP service publishes ports,
-gets `env_file`, or has a writable rootfs.
-
-One opt-in test talks to the real `filesystem-mcp` container and checks
-that `README.md` is readable, `.env`/`.ENV`/`.Env` return `ENOENT`, and
-writes return `EROFS` (requires Docker):
+**Live tests** (opt-in, real containers, nothing mocked). They skip
+unless asked for, and fail with the missing prerequisite when asked for
+but not runnable. Neither makes a paid LLM call: the agent request is
+skipped unless the agent runs `LLM_PROVIDER=mock`, and the multi-step
+checks drive the real graph with a scripted fake LLM.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-DOCKER_TESTS=1 pytest -k real_filesystem_mcp
+# Production compose stack (not the dev override: it publishes MCP ports on purpose)
+docker compose up -d --build
+DOCKER_TESTS=1 pytest tests/test_live_docker.py -v
+
+# Kubernetes (default context kind-mcp-agent; see Phase 8)
+K8S_TESTS=1 pytest tests/test_live_k8s.py -v
+K8S_TESTS=1 K8S_CONTEXT=docker-desktop pytest tests/test_live_k8s.py -v
 ```
+
+Both run `tests/live_probe.py` *inside* the agent container or pod, so
+it uses the agent's own config and network path. It reports only
+booleans and counts, never file contents or secret values, and checks:
+- **Filesystem MCP:** tools are discovered and the write tools are
+  filtered out. `README.md` is readable. `.env` (and `.ENV`, `.Env`,
+  `app/../.env`, `ENV~1`, `../.env`), `.git`, `.venv` and
+  `/proc/*/environ` are denied. `write_file` and `edit_file` fail with
+  `EROFS`.
+- **The real graph** chains several MCP tool calls; `write_file` is never
+  offered and is refused if requested; the 8-step limit holds.
+- **A dead MCP server** is skipped, not cached.
+- **With a GitHub token,** `X-MCP-Readonly: false` still yields no write
+  tools, and a real GitHub tool call works.
+
+On top of the probe:
+
+| | `test_live_docker.py` | `test_live_k8s.py` |
+|---|---|---|
+| Config / readiness | `compose config` valid; agent and filesystem-mcp healthy | all Deployments available |
+| Exposure | only the agent published, on `127.0.0.1:8000` | `/health` and a mock `/api/agent/run` through a port-forward the test starts and stops |
+| Hardening at runtime | users, read-only rootfs, `cap_drop`, `no-new-privileges` | same, plus no service-account token and `restricted` Pod Security |
+| Secrets | `/app` holds only `app/` and `requirements.txt`; `.env` values absent from image history and compose logs | Secret has only the two keys and no `last-applied` annotation; only the agent gets it; values match `.env` (compared as hashes) |
+| Other | supergateway leaves no child processes after the sessions close | NetworkPolicy: 6 allowed paths, 29 blocked paths, plus controls proving each blocked target is reachable without the policy |
+
+The NetworkPolicy tests need the policies applied on a cluster that
+enforces them (kind + Calico). On `docker-desktop` they're skipped as
+"not enforced"; and if the policies are applied there anyway, the
+blocked-path tests fail, because nothing is actually blocked.
 
 ## Example Request
 
@@ -342,12 +393,16 @@ LLM                                     LLM
  |                                       |
 tool_calls detected                     tool_calls detected
  |                                       |
-tool_fn.invoke(args)  (in-process)      MCP Client --stdio--> github-mcp-server --HTTPS--> GitHub API
+tool_fn.invoke(args)  (in-process)      MCP Client --HTTP--> github-mcp-server --HTTPS--> GitHub API
  |                                       |
 ToolMessage                             ToolMessage (same shape)
  |                                       |
 LLM                                     LLM
 ```
+
+(Phase 3 first reached the server over stdio, by spawning a container per
+session. Since Phase 7b it's its own long-running container, reached over
+streamable HTTP; see [Docker](#docker).)
 
 Both kinds of tool end up bound to the LLM and executed the same way
 (`agent_node`/`tool_node` in `app/agent/nodes.py` don't care which is
@@ -360,15 +415,17 @@ now `async`: `app/api/routes.py`'s `run()`, `app/agent/graph.py`'s
 
 ### Running the GitHub MCP server
 
-Requires Docker Desktop running locally. We don't start it by hand - the
-MCP client (`app/agent/mcp_tools.py`) launches
-`docker run -i --rm ghcr.io/github/github-mcp-server stdio --read-only`
-as a subprocess and talks to it over stdio the first time a GitHub tool
-is needed.
+It runs as its own service: `github-mcp` in `docker-compose.yml`, or
+`k8s/github-mcp.yaml` on Kubernetes, started as
+`github-mcp-server http --read-only`. `app/agent/mcp_tools.py` connects to
+it over streamable HTTP at `GITHUB_MCP_URL` (default
+`http://github-mcp:8082/`, the service name) and sends the PAT per request
+in the `Authorization` header, so the server itself holds no token.
 
-`--read-only` is hardcoded in `mcp_tools.py`, not an env var - the agent
-cannot create, update, delete, merge, or push anything on GitHub, and
-that can't be changed by misconfiguring `.env`.
+`--read-only` is set on the server's command line in those two files,
+not in `.env`. The agent can't create, update, delete, merge or push
+anything on GitHub. No request header can lift it either: the live
+tests check that `X-MCP-Readonly: false` still yields no write tools.
 
 ### Setup
 
@@ -405,8 +462,9 @@ flow through the identical `tool_node` code path.
 
 `tests/test_agent.py` adds `FakeGithubMcpTool` + `FakeGithubToolCallingLLM`,
 monkeypatched in the same way as Phase 2's fakes, so the "LLM picks an
-MCP tool, tool executes, result comes back" loop is proven without
-spawning a container or calling GitHub. Run with `pytest`.
+MCP tool, tool executes, result comes back" loop is proven without a
+running server or calling GitHub. Run with `pytest`. The real server is
+covered by the opt-in live tests (see [Test](#test)).
 
 ### Gemini LLM provider
 
@@ -449,20 +507,25 @@ a tool regardless of where it came from.
 ### Server and mount
 
 Uses the official `mcp/filesystem` image
-(`modelcontextprotocol/servers`), launched the same way as
-`github-mcp-server`: `app/agent/mcp_tools.py` runs
-`docker run -i --rm --mount type=bind,src=<repo root>/<entry>,dst=/projects/mcp-tool-calling-agent/<entry>,ro ... mcp/filesystem /projects/mcp-tool-calling-agent`,
-with one `--mount` per top-level entry of the repo, except `.env`
-(see Phase 6 - `.env` protection).
+(`modelcontextprotocol/servers`). It only speaks stdio, so `supergateway`
+fronts it with streamable HTTP (`filesystem-mcp/Dockerfile`), and
+`app/agent/mcp_tools.py` connects at `FILESYSTEM_MCP_URL` (default
+`http://filesystem-mcp:8000/mcp`). The server sees only
+`/projects/mcp-tool-calling-agent`:
 
-Two things are hardcoded, not env-configurable:
+- **Compose**: that directory is built from bind mounts listed one by one
+  in `docker-compose.yml`, every one `:ro`, and `.env` is never one of
+  them (see Phase 6, `.env` protection).
+- **Kubernetes**: there's no host disk to mount, so
+  `filesystem-mcp/Dockerfile.k8s` bakes a read-only snapshot in, built
+  from an allowlist that never includes `.env` (see Phase 8, 8d).
 
-- The mount sources are computed from `__file__` at runtime (always this
-  repo's own root, wherever it's checked out) - they can never be pointed
-  at another directory by editing `.env`.
-- Every mount uses the Docker `,ro` flag, so writes fail at the OS level
-  (`EROFS: read-only file system`) even if a write tool were somehow
-  invoked.
+Neither is configurable from `.env`: what's visible is fixed in those
+files, and writes fail at the OS level (`EROFS: read-only file system`)
+even if a write tool were somehow invoked.
+
+(Phase 4 first ran the server per session with `docker run -i` over stdio;
+Phase 7b moved it to its own container over HTTP.)
 
 ### Read-only tool allowlist
 
@@ -513,8 +576,9 @@ independent of the Python filtering.
 ### Testing without Docker
 
 `tests/conftest.py` forces `FILESYSTEM_MCP_ENABLED=false` for every test
-run, the same way it forces GitHub MCP off, so `pytest` never spawns
-either container.
+run, the same way it forces GitHub MCP off, so plain `pytest` never tries
+to reach either server. The real server is covered by the opt-in live
+tests (see [Test](#test)).
 
 No new dependencies were needed for this phase - `langchain-mcp-adapters`
 already supported multiple servers in one `MultiServerMCPClient`.
@@ -601,10 +665,11 @@ them could copy file data into server logs.
 
 `.env` holds the LLM API key and GitHub PAT, and it lives in the project
 root - which is exactly what Filesystem MCP exposes. Instead of mounting
-the root as a single directory, `app/agent/mcp_tools.py` now bind-mounts
-each top-level entry separately (all `,ro`) and skips `.env`, so the
-file **does not exist inside the container** - no tool call, path trick,
-or prompt can reach it.
+the root as a single directory, `docker-compose.yml` bind-mounts the
+project's entries one by one (all `:ro`) and never `.env`, so the file
+**does not exist inside the container** - no tool call, path trick, or
+prompt can reach it. (Kubernetes gets the same guarantee from the
+allowlist that builds its snapshot image; see Phase 8, 8d.)
 
 A single root mount with an empty file mounted over `.env` was tested
 and rejected: on a Windows host the bind mount is case-insensitive, so
@@ -614,17 +679,20 @@ Linux directory, and `.env`, `.ENV`, `.Env`, `app/../.env` and the
 Windows short name `ENV~1` all fail with `ENOENT` (verified against the
 real container). `.env.example` (placeholders only) stays readable.
 
-Limitation: the list of top-level entries is read when the tools are
-first discovered, so a top-level file added later is visible to the
-filesystem server only after an app restart.
+Limitation: the mount list is fixed, so a new top-level file or folder
+is invisible to the filesystem server until it's added to
+`docker-compose.yml` (and to `filesystem-mcp/Dockerfile.k8s.dockerignore`
+for Kubernetes). That is deliberate: nothing becomes readable by accident.
 
-### Read-only protections (unchanged)
+### Read-only protections
 
-- GitHub MCP: `--read-only` is hardcoded in `app/agent/mcp_tools.py`,
-  not configurable by env var.
-- Filesystem MCP: every Docker mount is `,ro`, and the hardcoded tool
-  allowlist keeps `write_file`, `edit_file`, `move_file` and
-  `create_directory` away from the LLM.
+- GitHub MCP: `--read-only` is on the server's command line in
+  `docker-compose.yml` and `k8s/github-mcp.yaml`, not configurable by env
+  var or request header.
+- Filesystem MCP: every Compose mount is `:ro` (Kubernetes: a root-owned
+  snapshot on a read-only root filesystem), and the hardcoded tool
+  allowlist in `app/agent/mcp_tools.py` keeps `write_file`, `edit_file`,
+  `move_file` and `create_directory` away from the LLM.
 - Neither can be changed by editing `.env`.
 
 ### Testing
@@ -636,10 +704,11 @@ missing API key and unsupported provider, a crashing MCP tool, a tool
 timeout, invalid tool arguments, a malformed tool call, one MCP server
 down while the other still works (with the PAT absent from the logs),
 the read-only allowlist and `,ro` mounts, and `.env` being excluded from
-the filesystem mounts. The opt-in `DOCKER_TESTS=1` test repeats the
-`.env` check against the real container.
+the filesystem mounts. The opt-in live tests repeat the `.env`,
+read-only, dead-server and step-limit checks against the real containers
+(see [Test](#test)).
 
-## Phase 8 — Kubernetes (in progress)
+## Phase 8 — Kubernetes
 
 Runs on Docker Desktop's built-in Kubernetes (Settings -> Kubernetes ->
 Enable, Kubeadm; context `docker-desktop`). Docker Compose keeps working

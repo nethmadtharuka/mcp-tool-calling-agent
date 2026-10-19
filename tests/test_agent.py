@@ -256,7 +256,6 @@ async def test_step_limit_stops_infinite_tool_loop(monkeypatch):
 # ---------------------------------------------------------------------------
 
 import asyncio  # noqa: E402
-import dataclasses  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
@@ -501,34 +500,8 @@ def test_compose_mcp_services_locked_down():
         assert all(p.startswith("127.0.0.1:") for p in svc.get("ports", []))
 
 
-# Opt-in: talks to the real filesystem-mcp container. Start it first with
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-#   DOCKER_TESTS=1 pytest -k real_filesystem_mcp
-@pytest.mark.skipif(os.getenv("DOCKER_TESTS") != "1", reason="set DOCKER_TESTS=1 to run")
-async def test_real_filesystem_mcp_hides_env():
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-
-    settings = dataclasses.replace(
-        _both_servers_settings(),
-        filesystem_mcp_url=os.getenv("FILESYSTEM_MCP_URL", "http://127.0.0.1:8001/mcp"),
-    )
-    client = MultiServerMCPClient(mcp_tools._filesystem_server_config(settings))
-    tools = {t.name: t for t in await client.get_tools(server_name="filesystem")}
-    read = tools.get("read_text_file") or tools["read_file"]
-    root = "/projects/mcp-tool-calling-agent"
-
-    assert "Production-Oriented AI Engineering Agent" in str(await read.ainvoke({"path": f"{root}/README.md"}))
-
-    # The server reports errors as text, not exceptions. Reduce to a bool
-    # so a failure can never print the file's contents in the report.
-    for name in [".env", ".ENV", ".Env", "app/../.env"]:
-        hidden = "ENOENT" in str(await read.ainvoke({"path": f"{root}/{name}"}))
-        assert hidden, f"{name} is readable inside the container"
-
-    # The agent never gets write_file (allowlist), but the mount must
-    # refuse it anyway.
-    result = str(await tools["write_file"].ainvoke({"path": f"{root}/probe.txt", "content": "x"}))
-    assert "EROFS" in result, "filesystem mount is writable"
+# The real filesystem-mcp checks (.env hidden, writes refused) live in
+# tests/test_live_docker.py and tests/test_live_k8s.py (opt-in).
 
 
 # ---------------------------------------------------------------------------
