@@ -14,8 +14,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root: unanchored, these also ignored frontend/src/lib/.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
