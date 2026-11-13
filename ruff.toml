@@ -1,0 +1,7 @@
+# Pinned here so CI and every machine lint the same way (ruff's
+# defaults: syntax errors, undefined names, unused imports...).
+target-version = "py313"
+extend-exclude = ["frontend"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]

@@ -99,8 +99,8 @@ def test_filesystem_mcp_single_replica_local_image_no_secrets():
 
 
 def test_k8s_snapshot_build_context_is_an_allowlist_without_secrets():
-    lines = [l.strip() for l in (_FS / "Dockerfile.k8s.dockerignore").read_text().splitlines()]
-    rules = [l for l in lines if l and not l.startswith("#")]
+    lines = [line.strip() for line in (_FS / "Dockerfile.k8s.dockerignore").read_text().splitlines()]
+    rules = [line for line in lines if line and not line.startswith("#")]
     assert rules[0] == "*"  # exclude everything first
     included = {r[1:].rstrip("/").lower() for r in rules if r.startswith("!")}
     assert not included & {".env", ".git", ".venv", "build.log", ".pytest_cache", "."}
@@ -209,7 +209,7 @@ def test_kind_cluster_config_pins_node_image_and_disables_default_cni():
 def test_k8s_dockerfile_pins_match_compose_dockerfile():
     def pins(name):
         text = (_FS / name).read_text()
-        return [l for l in text.splitlines() if l.startswith("FROM ") or "supergateway@" in l]
+        return [line for line in text.splitlines() if line.startswith("FROM ") or "supergateway@" in line]
 
     assert pins("Dockerfile.k8s") == pins("Dockerfile")
     assert "@sha256:" in pins("Dockerfile.k8s")[0]

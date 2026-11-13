@@ -258,7 +258,6 @@ async def test_step_limit_stops_infinite_tool_loop(monkeypatch):
 import asyncio  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-import pytest  # noqa: E402
 import yaml  # noqa: E402
 
 from langchain_core.messages.tool import invalid_tool_call  # noqa: E402
