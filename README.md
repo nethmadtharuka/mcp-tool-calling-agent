@@ -1,6 +1,13 @@
 # Production-Oriented AI Engineering Agent
 
+[![Backend CI](https://github.com/nethmadtharuka/mcp-tool-calling-agent/actions/workflows/backend-ci.yml/badge.svg)](https://github.com/nethmadtharuka/mcp-tool-calling-agent/actions/workflows/backend-ci.yml)
+[![Frontend CI](https://github.com/nethmadtharuka/mcp-tool-calling-agent/actions/workflows/frontend-ci.yml/badge.svg)](https://github.com/nethmadtharuka/mcp-tool-calling-agent/actions/workflows/frontend-ci.yml)
+
 ## Current Phase
+
+**Frontend.** A React web app for the agent lives in [`frontend/`](frontend/)
+(see [Frontend](#frontend)), with GitHub Actions CI for both halves (see
+[CI](#ci)).
 
 **Phase 8 — Kubernetes.** The same three services run on Kubernetes,
 with network isolation enforced on a local kind + Calico cluster (see
@@ -18,7 +25,7 @@ LLM providers: Google Gemini, OpenAI, and the mock model.
 ## Current Architecture
 
 ```text
-Client
+Client           (frontend/: React web app, or any HTTP client)
   ↓
 FastAPI          (app/api/routes.py, async)
   ↓
@@ -35,8 +42,8 @@ Response
 ## Future Architecture (not implemented yet)
 
 ```text
-Kubernetes
-GCP
+Backend on GCP
+Frontend on Vercel (prepared, not deployed: see Frontend)
 ```
 
 ## Project Structure
@@ -70,6 +77,9 @@ filesystem-mcp/        mcp/filesystem fronted by supergateway (stdio -> HTTP);
                        Dockerfile.k8s bakes in a read-only project snapshot
 k8s/                   Kubernetes manifests (Phase 8); kind/ = local cluster
                        config, optional/ = opt-in real-LLM egress policy
+frontend/              React + TypeScript + Vite web app (see Frontend)
+.github/workflows/     CI: backend-ci, frontend-ci, live-integration (manual)
+ruff.toml              Python lint rules (same locally and in CI)
 ```
 
 ## Setup
@@ -274,6 +284,63 @@ The NetworkPolicy tests need the policies applied on a cluster that
 enforces them (kind + Calico). On `docker-desktop` they're skipped as
 "not enforced"; and if the policies are applied there anyway, the
 blocked-path tests fail, because nothing is actually blocked.
+
+## Frontend
+
+A React web app for the agent, built from the UI/UX design in `design/`:
+Workspace, Execution, Run History, Connected Tools, Providers and
+Settings. It talks to the backend only through the two existing
+endpoints, `GET /health` and `POST /api/agent/run`.
+
+```bash
+python run.py                 # backend on 127.0.0.1:8000 (any LLM_PROVIDER)
+cd frontend
+npm ci
+npm run dev                   # http://localhost:5173, proxies /api and /health to the backend
+```
+
+What the UI shows is limited to what the API returns. The design marks
+some features "Concept", and the app keeps those labels:
+
+| Feature | Status |
+|---|---|
+| Run a task, final answer, errors, step-limit notice, live backend health | Works against the real API |
+| Run History | Real runs, stored in this browser's `localStorage`; the backend stores nothing |
+| Per-step tool timeline, provider/model/tool-call counts | Concept: the API returns only the final response |
+| Provider switching | Concept: the provider is set on the server (`LLM_PROVIDER`) |
+| MCP server status, discovered tool list | Not reported by the API; the Tools page shows the configured read-only policy instead |
+
+**Configuration** (`frontend/.env.example`; everything in it ends up in the
+public JS bundle, so it never holds secrets):
+
+| Variable | Where | Purpose |
+|---|---|---|
+| `VITE_API_BASE_URL` | build time | Backend URL, e.g. `https://agent-api.example.com`. Empty = same origin (dev proxy). |
+| `VITE_DEV_PROXY_TARGET` | dev/preview server only | Where `npm run dev` forwards `/api` and `/health` (default `http://127.0.0.1:8000`) |
+
+**Backend CORS.** A frontend on another origin (e.g. Vercel) needs the
+backend to allow it. Set `CORS_ALLOW_ORIGINS` on the backend to the exact
+origin(s), comma-separated. It's off by default, allows only `GET`/`POST`
+with `Content-Type`, and never sends credentials. Local dev doesn't need
+it, because of the proxy.
+
+**Vercel (prepared, not deployed).** Import the repo with Root Directory
+`frontend`; `frontend/vercel.json` sets the Vite build, the SPA fallback
+(deep links and refreshes work) and immutable caching for hashed assets.
+Set `VITE_API_BASE_URL` in the Vercel project, and `CORS_ALLOW_ORIGINS` on
+the backend. **The API has no authentication**, so don't expose a backend
+that holds real keys publicly until it has some.
+
+## CI
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `backend-ci.yml` | push / PR (except frontend-only or docs-only changes) | `ruff check`, `pytest` with coverage (report and summary uploaded); builds the agent and filesystem-mcp images, validates both compose files, and checks that no `.env` is in the images |
+| `frontend-ci.yml` | push / PR touching `frontend/` | `npm ci`, ESLint, `tsc`, Vitest, production build, and a guard against local backend URLs in the bundle |
+| `live-integration.yml` | manual (`workflow_dispatch`) | Starts the real Compose stack (mock LLM, no secrets) and runs `tests/test_live_docker.py` |
+
+No workflow needs a secret. Every action is pinned to a commit SHA, and
+jobs get read-only `contents` permission.
 
 ## Example Request
 

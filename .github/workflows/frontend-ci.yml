@@ -1,0 +1,77 @@
+name: Frontend CI
+
+on:
+  push:
+    paths: ["frontend/**", ".github/workflows/frontend-ci.yml"]
+  pull_request:
+    paths: ["frontend/**", ".github/workflows/frontend-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: frontend
+
+jobs:
+  build:
+    name: Lint, type-check, test & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      # VITE_API_BASE_URL is public build config, not a secret. Set it as a
+      # repository *variable* to bake a backend URL in; empty = same origin.
+      - name: Production build
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+
+      - name: No local backend address in the bundle
+        run: |
+          if grep -rnE 'localhost:[0-9]+|127\.0\.0\.1' dist/; then
+            echo "::error::Production bundle references a local backend address"
+            exit 1
+          fi
+
+      - name: Bundle size summary
+        run: |
+          {
+            echo "### Frontend production build"
+            echo '```'
+            du -sh dist
+            ls -l dist/assets/*.js dist/assets/*.css | awk '{print $5, $9}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
